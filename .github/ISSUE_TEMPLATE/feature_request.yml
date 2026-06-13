@@ -1,0 +1,59 @@
+name: Feature Request
+description: Suggest an improvement or new capability suitable for public discussion.
+title: "[FEATURE] "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for suggesting an improvement.
+
+        **All submissions are public. Do not include confidential information, credentials, source code from private repositories, proprietary technical details, customer information, or security-sensitive material.**
+
+        Please describe the user problem and desired behavior without revealing private implementation details.
+
+  - type: textarea
+    id: problem-statement
+    attributes:
+      label: Problem Statement
+      description: What problem should this project solve?
+      placeholder: Describe the user need or limitation.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed-solution
+    attributes:
+      label: Proposed Solution
+      description: Describe the behavior or outcome you would like to see.
+      placeholder: Explain the requested feature at a product or workflow level.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives-considered
+    attributes:
+      label: Alternatives Considered
+      description: What other approaches or workarounds have you considered?
+      placeholder: List public, non-sensitive alternatives or current workarounds.
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional Context
+      description: Add public context, examples, links, or screenshots that clarify the request.
+      placeholder: Include only information that is safe for public disclosure.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: public-disclosure
+    attributes:
+      label: Public Disclosure Confirmation
+      description: Confirm that this request is safe for public disclosure.
+      options:
+        - label: I have removed confidential information, credentials, private source code, proprietary technical details, customer information, and security-sensitive material.
+          required: true

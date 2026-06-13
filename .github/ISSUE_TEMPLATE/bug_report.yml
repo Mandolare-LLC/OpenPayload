@@ -1,0 +1,108 @@
+name: Bug Report
+description: Report a reproducible problem suitable for public disclosure.
+title: "[BUG] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for helping improve this project.
+
+        **All submissions are public. Do not include confidential information, credentials, source code from private repositories, proprietary technical details, customer information, or security-sensitive material.**
+
+        If you believe you have found a security vulnerability, do not open a public issue. Follow the process in `SECURITY.md`.
+
+  - type: input
+    id: summary
+    attributes:
+      label: Summary
+      description: Provide a concise summary of the problem.
+      placeholder: Briefly describe what is broken.
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: Describe the issue using information that is safe for public disclosure.
+      placeholder: Explain the user-visible behavior and impact.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps-to-reproduce
+    attributes:
+      label: Steps to Reproduce
+      description: Provide clear reproduction steps. Prefer behavioral descriptions over private source code or internal implementation details.
+      placeholder: |
+        1. Go to ...
+        2. Click ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected-behavior
+    attributes:
+      label: Expected Behavior
+      description: What did you expect to happen?
+      placeholder: Describe the expected result.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual-behavior
+    attributes:
+      label: Actual Behavior
+      description: What actually happened?
+      placeholder: Describe the actual result.
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      description: Share public, non-sensitive environment details.
+      placeholder: For example, operating system, browser, device, or runtime.
+    validations:
+      required: false
+
+  - type: input
+    id: application-version
+    attributes:
+      label: Application Version
+      description: Provide the public release version, commit SHA, or build identifier if available.
+      placeholder: For example, v1.2.3.
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs-screenshots
+    attributes:
+      label: Logs / Screenshots
+      description: Attach only sanitized logs or screenshots with secrets, credentials, customer data, and private information removed.
+      placeholder: Paste sanitized logs or drag screenshots here.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional Context
+      description: Add any other public, non-sensitive context that may help maintainers understand the issue.
+      placeholder: Include links to public references or related public issues, if relevant.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: public-disclosure
+    attributes:
+      label: Public Disclosure Confirmation
+      description: Confirm that this report is safe for public disclosure.
+      options:
+        - label: I have removed confidential information, credentials, private source code, proprietary technical details, customer information, and security-sensitive material.
+          required: true

@@ -1,0 +1,9 @@
+# GitHub Issue Template configuration.
+blank_issues_enabled: false
+contact_links:
+  - name: General Questions and Community Discussions
+    url: https://github.com/Mandolare-LLC/Talaria/discussions
+    about: Use GitHub Discussions for general conversations if Discussions are enabled for this repository.
+  - name: Security Vulnerability Reports
+    url: https://github.com/Mandolare-LLC/Talaria/security/policy
+    about: Do not open public issues for security concerns. Follow the private responsible disclosure process in SECURITY.md.
