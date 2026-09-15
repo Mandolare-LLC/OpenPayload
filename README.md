@@ -1,4 +1,4 @@
-# Talaria Public Repository
+# OpenPayload Public Repository
 
 This repository is intended for public bug reporting, support requests, documentation feedback, feature requests, and community interaction.
 
