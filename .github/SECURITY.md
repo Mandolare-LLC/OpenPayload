@@ -6,7 +6,7 @@ Please do not report security vulnerabilities through public GitHub Issues, pull
 
 To report a vulnerability privately, email:
 
-`security@talaria.chat`
+`security@openpayload.io`
 
 Include only information that is safe to share with the maintainers and necessary to investigate the report. Do not include credentials, secrets, private keys, customer data, or proprietary source code unless the maintainers explicitly request a secure transfer method.
 
