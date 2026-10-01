@@ -1,0 +1,41 @@
+[package]
+name = "pallet-resource-rewards"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+codec = { workspace = true, features = ["derive"] }
+frame-support = { workspace = true }
+frame-system = { workspace = true }
+frame-benchmarking = { optional = true, workspace = true }
+pallet-delivery-policy = { workspace = true }
+pallet-opal = { workspace = true }
+scale-info = { workspace = true, features = ["derive"] }
+sp-runtime = { workspace = true }
+sp-core = { workspace = true }
+
+[dev-dependencies]
+pallet-balances = { workspace = true, features = ["std"] }
+pallet-did-registry = { workspace = true, features = ["std"] }
+pallet-timestamp = { workspace = true, features = ["std"] }
+sp-io = { workspace = true, features = ["std"] }
+sp-core = { workspace = true, features = ["std"] }
+
+[features]
+default = ["std"]
+std = [
+	"codec/std",
+	"frame-benchmarking?/std",
+	"frame-support/std",
+	"frame-system/std",
+	"pallet-delivery-policy/std",
+	"pallet-opal/std",
+	"scale-info/std",
+	"sp-runtime/std",
+	"sp-core/std",
+]
+runtime-benchmarks = [
+	"frame-benchmarking/runtime-benchmarks",
+	"frame-support/runtime-benchmarks",
+	"frame-system/runtime-benchmarks",
+]

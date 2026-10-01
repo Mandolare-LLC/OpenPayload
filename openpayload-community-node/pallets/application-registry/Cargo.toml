@@ -1,0 +1,36 @@
+[package]
+name = "pallet-application-registry"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+publish = false
+
+[dependencies]
+codec = { workspace = true, features = ["derive"] }
+frame-support = { workspace = true }
+frame-system = { workspace = true }
+pallet-delivery-policy = { workspace = true }
+scale-info = { workspace = true, features = ["derive"] }
+sp-runtime = { workspace = true, default-features = false }
+
+[dev-dependencies]
+sp-io = { workspace = true, features = ["std"] }
+
+[features]
+default = ["std"]
+std = [
+    "codec/std",
+    "frame-support/std",
+    "frame-system/std",
+    "pallet-delivery-policy/std",
+    "scale-info/std",
+    "sp-runtime/std",
+]
+try-runtime = [
+    "frame-support/try-runtime",
+    "frame-system/try-runtime",
+    "pallet-delivery-policy/try-runtime",
+    "sp-runtime/try-runtime",
+]

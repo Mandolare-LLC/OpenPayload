@@ -1,0 +1,36 @@
+[package]
+name = "pallet-delivery-policy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+codec = { workspace = true, features = ["derive"] }
+frame-support = { workspace = true }
+frame-system = { workspace = true }
+pallet-timestamp = { workspace = true }
+scale-info = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, default-features = false, features = ["alloc"] }
+sp-api = { workspace = true }
+sp-runtime = { workspace = true }
+
+[dev-dependencies]
+sp-io = { workspace = true, features = ["std"] }
+
+[features]
+default = ["std"]
+std = [
+	"codec/std",
+	"frame-support/std",
+	"frame-system/std",
+	"pallet-timestamp/std",
+	"scale-info/std",
+	"serde_json/std",
+	"sp-api/std",
+	"sp-runtime/std",
+]
+
+try-runtime = [
+	"frame-support/try-runtime",
+	"frame-system/try-runtime",
+	"sp-runtime/try-runtime",
+]

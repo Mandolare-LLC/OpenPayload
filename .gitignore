@@ -1,0 +1,32 @@
+# Operating system and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
+
+# Build output and caches
+target/
+node_modules/
+dist/
+coverage/
+.cache/
+__pycache__/
+.pytest_cache/
+*.rs.bk
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+!.env.sample
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Local node state and logs
+node-data/
+keystore/
+*.log

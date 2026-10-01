@@ -1,0 +1,46 @@
+[package]
+name = "pallet-authority-governance"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+publish = false
+
+[dependencies]
+codec = { workspace = true, features = ["derive"] }
+frame-support = { workspace = true }
+frame-system = { workspace = true }
+pallet-aura = { workspace = true }
+pallet-grandpa = { workspace = true }
+scale-info = { workspace = true, features = ["derive"] }
+sp-consensus-aura = { workspace = true }
+sp-consensus-grandpa = { workspace = true }
+sp-runtime = { workspace = true }
+
+[dev-dependencies]
+pallet-timestamp = { workspace = true, features = ["std"] }
+sp-core = { workspace = true, features = ["std"] }
+sp-io = { workspace = true, features = ["std"] }
+sp-keyring = { workspace = true, features = ["std"] }
+
+[features]
+default = ["std"]
+std = [
+    "codec/std",
+    "frame-support/std",
+    "frame-system/std",
+    "pallet-aura/std",
+    "pallet-grandpa/std",
+    "scale-info/std",
+    "sp-consensus-aura/std",
+    "sp-consensus-grandpa/std",
+    "sp-runtime/std",
+]
+try-runtime = [
+    "frame-support/try-runtime",
+    "frame-system/try-runtime",
+    "pallet-aura/try-runtime",
+    "pallet-grandpa/try-runtime",
+    "sp-runtime/try-runtime",
+]
