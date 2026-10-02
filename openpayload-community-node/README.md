@@ -1,6 +1,6 @@
 # OpenPayload community full node
 
-This repository contains the source needed to build a non-authority OpenPayload
+This directory contains the source needed to build a non-authority OpenPayload
 full node. The runtime and its pallets are included because the node depends on
 them to compile and verify chain state. This source does not include operator
 infrastructure, signing material, launch ceremonies, or private deployment
@@ -22,6 +22,11 @@ cargo build --locked --release -p openpayload-node
 
 The binary is `target/release/openpayload-node`.
 
+Building requires a C/C++ compiler and LLVM/Clang with `libclang` available for
+the RocksDB dependency. On macOS with Command Line Tools, if the build cannot
+find `libclang.dylib`, set `LIBCLANG_PATH` and `DYLD_LIBRARY_PATH` to
+`/Library/Developer/CommandLineTools/usr/lib` and retry.
+
 ## Join the live network
 
 The canonical live raw chain specification is
@@ -36,10 +41,17 @@ Run an ordinary full node with the verified specification:
 ```sh
 ./target/release/openpayload-node \
   --chain chain-spec/openpayload.raw.json \
+  --sync warp \
   --base-path /absolute/path/to/node-data \
   --name community-full-node \
   --rpc-methods safe
 ```
+
+Use warp sync for a fresh node. It verifies chain finality, downloads current
+state, and then follows new blocks. The advertised peers did not serve the
+earliest blocks during our full-sync test, so a default sync from genesis
+stayed at block zero. Warp sync does not provide historical block bodies; an
+archive node or a suitable snapshot is needed if you require complete history.
 
 Do not add `--validator` or install authority, sudo, sponsor, or resource-validator
 keys. Keep RPC bound to loopback unless you have separately secured a public RPC
@@ -57,10 +69,9 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 
 ## Security and licensing
 
-Report suspected vulnerabilities through this GitHub repository's private
-vulnerability reporting feature. The repository owner must enable that feature
-before making the repository public. Do not post exploit details in a public
-issue.
+Report suspected vulnerabilities using the parent repository's
+[Security Policy](../.github/SECURITY.md). Do not post exploit details in a
+public issue.
 
 Project-authored source is released under the [Unlicense](LICENSE). The
 upstream-derived `runtime/src/genesis_config_presets.rs` retains its
