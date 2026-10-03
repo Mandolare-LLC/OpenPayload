@@ -1,4 +1,4 @@
-# Hello World: DID, Relay, and Cache
+# Hello World: Directory, Relay, and Cache
 
 This is the smallest end-to-end example using the Python tools. It creates a
 new DID with a Cache service, sends one plaintext message through the Relay,
