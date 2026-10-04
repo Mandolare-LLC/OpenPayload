@@ -1,6 +1,7 @@
 # OpenPayload CLI tools
 
 For a minimal end-to-end example, see [Hello World](HELLO_WORLD.md).
+For a live receiver with shell redirection, see [WebSocket tunnel to stdout](WEBSOCKET_TUNNEL.md).
 
 `openpayload_did.py` creates and manages a DID through an OpenDispatch Directory. It never connects to a chain RPC node or SCALE-encodes an authorization payload. Private keys remain on the local machine. The Directory defaults to `https://directory.openpayload.io`; use `--directory-url` on any network command to select another Directory.
 
@@ -210,6 +211,32 @@ profile text as `info`. The UTF-8 AEAD associated data is
 For an unchunked envelope, use an empty group ID, sequence `0`, and total `1`.
 After decryption, check the protected group/index against the outer envelope,
 concatenate `data` in sequence, and verify `size_bytes` and `sha256`.
+
+# Live WebSocket receive
+
+`payload_ws.py` opens a receiving session on a Relay and writes each message's
+original bytes to stdout. Publish that Relay's HTTPS endpoint on the DID with
+`openpayload_did.py create --relay-url https://relay.example.com` (or add an
+`OpenPayloadRelayService` to an existing DID), then connect before sending.
+Install the additional dependency with Python 3.10+:
+
+```sh
+python3 -m pip install cryptography 'websockets>=15,<18'
+python3 tools/payload_ws.py --did 'did:openpayload:...' \
+  --relay-ws-url wss://relay.example.com --device-id cli --once > received.bin
+```
+
+Wait for `"status":"listening"` on stderr, then use the existing package/send
+pipeline. Omit `--once` to receive continuously; stdout concatenates payload
+bytes in arrival order with no added separators. Welcome and receipt notices
+go to stderr. `--decryption-key-file` selects a local X25519 PEM key for
+encrypted records; plaintext Hello World records need no key. Size and SHA-256
+are checked before each write. This tool supports unchunked records from
+`payload_package.py`; use the Cache receiver for chunked files. It makes no
+Directory or Cache requests, retrieves no earlier messages, and requires a
+restart if the WebSocket closes. `--allow-insecure` applies only to WebSocket
+TLS verification. See [WebSocket tunnel to stdout](WEBSOCKET_TUNNEL.md) for the
+complete Hello World variant and shell redirection examples.
 
 # Cache query and receive
 
