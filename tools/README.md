@@ -1,4 +1,4 @@
-# OpenPayload DID tool
+# OpenPayload CLI tools
 
 For a minimal end-to-end example, see [Hello World](HELLO_WORLD.md).
 
@@ -12,13 +12,13 @@ python3 -m pip install cryptography
 
 ## TLS testing
 
-All four CLI scripts accept `--allow-insecure` to skip HTTPS certificate
+All CLI tools accept `--allow-insecure` to skip HTTPS certificate
 verification for a single test run. For commands with subcommands, place it
 after the command (and verb, when present), for example:
 
 ```sh
-python3 scripts/openpayload_did.py resolve --did DID --allow-insecure
-python3 scripts/payload_cache.py query --did DID --signing-key-file root.pem --allow-insecure
+python3 tools/openpayload_did.py resolve --did DID --allow-insecure
+python3 tools/payload_cache.py query --did DID --signing-key-file root.pem --allow-insecure
 ```
 
 `payload_package.py --allow-insecure` applies to its Directory lookup;
@@ -33,7 +33,7 @@ proof checks, Cache authorization, or payload encryption.
 Generate a root Ed25519 key, build a minimal DID document, submit it, and wait for on-chain confirmation:
 
 ```sh
-python3 scripts/openpayload_did.py create \
+python3 tools/openpayload_did.py create \
   --key-out "$HOME/openpayload-root.key" \
   --output "$HOME/openpayload-registration.json"
 ```
@@ -45,7 +45,7 @@ Reuse an Ed25519 pair with `--private-key-file root.pem` and optionally `--publi
 To create a complete public DID document without *any* network request:
 
 ```sh
-python3 scripts/openpayload_did.py create --document-only \
+python3 tools/openpayload_did.py create --document-only \
   --key-out "$HOME/openpayload-root.key" \
   --output "$HOME/openpayload-did-document.json"
 ```
@@ -57,19 +57,19 @@ In this mode `--output` contains the DID document itself. Run `create --interact
 Read status, the public DID record, or authorization nonces:
 
 ```sh
-python3 scripts/openpayload_did.py status --did 'did:openpayload:...'
-python3 scripts/openpayload_did.py resolve --did 'did:openpayload:...'
-python3 scripts/openpayload_did.py nonces --did 'did:openpayload:...'
+python3 tools/openpayload_did.py status --did 'did:openpayload:...'
+python3 tools/openpayload_did.py resolve --did 'did:openpayload:...'
+python3 tools/openpayload_did.py nonces --did 'did:openpayload:...'
 ```
 
 Mutations use `--signing-key-file root.pem` and `--did DID`. The Directory prepares and validates the request, including the current nonce and exact bytes to sign. The tool signs those bytes locally, submits the request, and waits for confirmation. Examples:
 
 ```sh
-python3 scripts/openpayload_did.py alias add --did DID --alias team.one --signing-key-file root.pem
-python3 scripts/openpayload_did.py document replace --did DID --document-file document.json --signing-key-file root.pem
-python3 scripts/openpayload_did.py service add --did DID --data-file service.json --signing-key-file root.pem
-python3 scripts/openpayload_did.py device tombstone --did DID --device-id phone-1 --signing-key-file root.pem
-python3 scripts/openpayload_did.py delete --did DID --signing-key-file root.pem
+python3 tools/openpayload_did.py alias add --did DID --alias team.one --signing-key-file root.pem
+python3 tools/openpayload_did.py document replace --did DID --document-file document.json --signing-key-file root.pem
+python3 tools/openpayload_did.py service add --did DID --data-file service.json --signing-key-file root.pem
+python3 tools/openpayload_did.py device tombstone --did DID --device-id phone-1 --signing-key-file root.pem
+python3 tools/openpayload_did.py delete --did DID --signing-key-file root.pem
 ```
 
 Available groups and verbs are:
@@ -102,7 +102,7 @@ Exit codes are `0` for success or accepted submission, `1` for failure, and `2` 
 Run the offline tests with:
 
 ```sh
-python3 -m unittest discover -s scripts -p 'test_*.py'
+python3 -m unittest discover -s tools -p 'test_*.py'
 ```
 
 # Binary payload to Relay
@@ -118,15 +118,15 @@ Text and pre-assembled JSON inputs are accepted as bytes and preserved exactly;
 The package tool does not parse or rewrite JSON input.
 
 ```sh
-python3 scripts/payload_package.py --to 'did:openpayload:...' --input file.img \
-  | python3 scripts/payload_send.py --relay-url https://relay.example.com
+python3 tools/payload_package.py --to 'did:openpayload:...' --input file.img \
+  | python3 tools/payload_send.py --relay-url https://relay.example.com
 ```
 
 Omit `--input` to read binary standard input:
 
 ```sh
-python3 scripts/payload_package.py --to 'did:openpayload:...' < file.img \
-  | python3 scripts/payload_send.py --relay-url https://relay.example.com
+python3 tools/payload_package.py --to 'did:openpayload:...' < file.img \
+  | python3 tools/payload_send.py --relay-url https://relay.example.com
 ```
 
 In `zsh` or `bash`, run `set -o pipefail` first if you want the pipeline's exit status
@@ -134,9 +134,9 @@ to report a packaging error as well as a sending error. For a resumable submissi
 save the exact encrypted envelopes and send that file:
 
 ```sh
-python3 scripts/payload_package.py --to 'did:openpayload:...' --input file.img \
+python3 tools/payload_package.py --to 'did:openpayload:...' --input file.img \
   --output file.envelopes.jsonl
-python3 scripts/payload_send.py --relay-url https://relay.example.com \
+python3 tools/payload_send.py --relay-url https://relay.example.com \
   --input file.envelopes.jsonl --output send-result.json
 ```
 
@@ -156,9 +156,9 @@ SHA-256, and chunk count before writing any envelopes.
 For an intentionally unencrypted example, use both explicit flags:
 
 ```sh
-python3 scripts/payload_package.py --to 'did:openpayload:...' --input file.img \
+python3 tools/payload_package.py --to 'did:openpayload:...' --input file.img \
   --plaintext \
-  | python3 scripts/payload_send.py --relay-url https://relay.example.com \
+  | python3 tools/payload_send.py --relay-url https://relay.example.com \
       --allow-plaintext
 ```
 
@@ -222,7 +222,7 @@ For an automation or cron check, this command requests only Cache summary
 metadata (IDs and chunk positions), not message envelopes:
 
 ```sh
-python3 scripts/payload_cache.py query --did 'did:openpayload:...' \
+python3 tools/payload_cache.py query --did 'did:openpayload:...' \
   --signing-key-file "$HOME/openpayload-root.key"
 ```
 
@@ -237,7 +237,7 @@ Receive one file by any of its message IDs, decrypt and decode its CBOR records,
 verify their SHA-256 and chunk sequence, then save the original bytes:
 
 ```sh
-python3 scripts/payload_cache.py receive --did 'did:openpayload:...' \
+python3 tools/payload_cache.py receive --did 'did:openpayload:...' \
   --signing-key-file "$HOME/openpayload-root.key" \
   --decryption-key-file "$HOME/openpayload-agreement.key" \
   --message-id UUID --output received.img
@@ -259,7 +259,7 @@ downloading them**. Deleted messages cannot be recovered from Cache. Purge one
 exact message ID interactively, or add `--confirm` for automation:
 
 ```sh
-python3 scripts/payload_cache.py purge --did 'did:openpayload:...' \
+python3 tools/payload_cache.py purge --did 'did:openpayload:...' \
   --signing-key-file "$HOME/openpayload-root.key" --message-id UUID
 ```
 
@@ -288,5 +288,176 @@ encrypted CBOR records are decoded locally after retrieval. Its explicit
 `--plaintext` mode can be received without `--decryption-key-file`.
 
 ```sh
-python3 -m unittest discover -s scripts -p 'test_*.py'
+python3 -m unittest discover -s tools -p 'test_*.py'
 ```
+
+## Register an Application or Persona
+
+`openpayload_register.py` registers a Persona or Application through the Directory,
+renews DNS verification, and recovers a domain Persona into a replacement DID.
+It signs Directory-prepared bytes locally; it never performs SCALE encoding,
+chain RPC, or its own DNS lookup. It requires the sibling `openpayload_did.py`.
+Use Python on Linux or macOS for the cron and file-locking examples below.
+
+The new Directory release allows 48-hour DNS challenges and up to 365 days of
+verification. Recovery requires runtime **spec 124 or later** and the new
+Directory endpoints. These changes must be deployed before using recovery on
+alpha; installing the Python tool alone does not enable chain recovery.
+
+Register a domain Persona and save progress:
+
+```sh
+python3 tools/openpayload_register.py persona register \
+  --name example.com --operator-did "$DID" --signing-key-file root.key \
+  --state-file persona-state.json --output persona-result.json
+```
+
+The tool displays the TXT name and value on stderr, then polls the Directory.
+Publish the exact value in DNS. `--challenge-only` saves and prints the challenge
+without submission. Resume after coordinating with a DNS administrator:
+
+```sh
+python3 tools/openpayload_register.py resume --state-file persona-state.json
+```
+
+The state file records the issuing Directory URL, exact signed intent, and
+progress, with mode `0600`. It contains no private key or email confirmation
+token. Keep the signing key at its saved local path, or pass
+`--signing-key-file` when resuming. For an encrypted key in unattended operation,
+set `OPENPAYLOAD_KEY_PASSWORD` in the process environment.
+
+Register an Application and bind its domain:
+
+```sh
+python3 tools/openpayload_register.py application register \
+  --application-id example --control-did "$DID" --domain example.com \
+  --signing-key-file root.key --state-file application-state.json
+```
+
+An Application ID itself does not require DNS and does not expire. `--domain`
+requires an active DNS Persona under its control DID. The tool registers or
+renews that Persona when necessary, waits for confirmation, then registers the
+Application and binds the domain. An existing Persona owned by another DID must
+be recovered separately. Multiple Applications can share the same domain and
+control DID. A single-label Persona such as `compliance` skips DNS entirely.
+
+### Automation and renewal
+
+Use `persona renew` daily from cron. It renews only within the configured window
+(default 30 days before expiry), requesting 365 days by default. It automatically
+resumes unfinished matching renewal state. Named Personas have no DNS expiry.
+
+```sh
+python3 tools/openpayload_register.py persona renew \
+  --name example.com --operator-did "$DID" --signing-key-file /secure/root.key \
+  --dns-auth-hook /opt/openpayload/publish-txt \
+  --dns-cleanup-hook /opt/openpayload/remove-txt \
+  --state-file /var/lib/openpayload/example-renewal.json --non-interactive
+```
+
+For example, a cron entry can run the same command at `03:15` each day. Use
+absolute paths, provide `DID` and the DNS provider credentials in that job's
+environment, and retain its result/error logs. No renewal runs without the local
+signing key and fresh domain proof.
+
+Each DNS hook is an executable path, invoked without a shell command string.
+It receives the Directory challenge JSON on stdin, including `record_name` and
+`record_value`. The authentication hook publishes that exact TXT value; the
+cleanup hook removes only that value after confirmed processing. Hooks obtain
+provider credentials from their own environment; the Directory receives none.
+`--hook-timeout` defaults to 120 seconds.
+
+Common options:
+
+| Option | Behavior |
+| --- | --- |
+| `--directory-url` | Defaults to `https://directory.openpayload.io`; accepts a hostname without a scheme |
+| `--signer-key-id` | Default: infer a published Ed25519 key matching the local key |
+| `--controller-key-id` | Repeat to select initial controllers; default is the signer |
+| `--verification-days` | 1–365 days, default 365 |
+| `--renew-before-days` | Renewal window, default 30 days |
+| `--force-renew` | Renew now even outside the normal renewal window |
+| `--constraints-file` | Requested Persona delivery constraints JSON |
+| `--no-wait` | Return the first accepted `tx_id`; resume finishes remaining phases |
+| `--output` | Save the JSON result to a file; `-` means stdout |
+| `--timeout` / `--poll-interval` | Default 600 seconds / 10 seconds |
+| `--interactive` / `--non-interactive` | Prompt for missing input, or never prompt |
+| `--allow-insecure` | Skip TLS verification for CLI testing |
+
+Every run emits one JSON result. `--output` also saves that result. Exit code
+`0` covers confirmation, no renewal due, saved challenge, accepted submission,
+or a pending recovery window; `1` covers failure; `2` covers timeout or an unknown
+submission outcome. A lost submission response is reconciled against chain
+state before retrying. `--no-wait` cannot produce a transaction ID until a proof
+has been verified; it reports `awaiting_proof` when submission is not yet possible.
+
+### Recover a domain Persona
+
+Create a replacement DID first and publish its signing key. Then start recovery:
+
+```sh
+python3 tools/openpayload_register.py persona recover \
+  --name example.com --operator-did "$NEW_DID" --signing-key-file new-root.key \
+  --request-email --policy preserve --state-file recovery-state.json
+```
+
+`--policy preserve` is the default. Recovery retains policy graph rules and
+references and assigns the new operator metadata. `--policy clear` atomically
+removes the Persona's V2 and V3 policies. Existing Persona delivery constraints
+remain in either mode. References to the old DID inside graphs are not rewritten.
+The new controller set is bound to the recovery request.
+
+The Directory sends the optional email challenge only to
+`openpayload-recovery@{domain}`. Put its token in a local file, then confirm and
+continue:
+
+```sh
+python3 tools/openpayload_register.py resume \
+  --state-file recovery-state.json --email-token-file recovery-token.txt
+```
+
+`--email-token-file -` reads the token from stdin. The token is never saved in
+state or printed in the result. `resume --request-email` adds email proof to an
+existing DNS recovery. `--email-only` starts an email-only recovery.
+
+| Proofs | Completion |
+| --- | --- |
+| Fresh DNS and email | Immediate, including after controller cancellation |
+| Fresh DNS or email, plus seven elapsed days | Allowed, including after cancellation |
+| Neither proof | Never |
+
+A controller cancellation records an objection and cannot restart the timer.
+The timer begins with the first verified proof included in finalized chain
+state. DNS and email proofs last 48 hours, so a single-factor recovery must
+refresh proof near day seven. Resume preserves the original chain timer. A
+pending chain recovery expires after 14 days; expired entries are pruned when a
+new request is submitted, with at most eight pending requests per domain.
+Directory challenges expire and are periodically purged after 48 hours.
+
+Status and controller objection commands:
+
+```sh
+python3 tools/openpayload_register.py persona recovery-status \
+  --name example.com --recovery-id '0x<64-hex-characters>'
+python3 tools/openpayload_register.py persona recovery-cancel \
+  --name example.com --recovery-id '0x<64-hex-characters>' \
+  --signing-key-file old-root.key
+```
+
+`persona recovery-confirm-email` confirms a token separately, and
+`persona recovery-finalize` submits an eligible recovery explicitly. Ordinary
+`resume` handles proof refresh and finalization automatically. You can schedule
+`resume --state-file recovery-state.json --non-interactive` to check a pending
+recovery; it returns promptly during the seven-day window. DNS hooks are needed
+for unattended proof refresh; email-only refresh requires a newly delivered token.
+
+Recovery changes the Persona operator. It does not restore a lost DID key or
+transfer separately registered Application ownership. Single-label Personas
+cannot use domain or email recovery. DNS and email both depend on domain control;
+they are not independent factors against compromise of the DNS administration.
+
+The Directory operator must configure recovery email delivery. SMTP settings are
+`OPENPAYLOAD_RECOVERY_SMTP_HOST`, `OPENPAYLOAD_RECOVERY_SMTP_PORT` (default 587),
+`OPENPAYLOAD_RECOVERY_SMTP_USER`, `OPENPAYLOAD_RECOVERY_SMTP_PASSWORD`, and
+`OPENPAYLOAD_RECOVERY_EMAIL_FROM`. STARTTLS and server certificate validation are
+required. DNS-only recovery remains available without email delivery configured.
