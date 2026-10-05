@@ -157,7 +157,13 @@ class WebSocketReceiverTests(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as directory:
             key = str(Path(directory) / "root.pem")
-            with patch.object(did_tool, "request", return_value={"tx_id": "test", "registration_status": "pending"}) as request, \
+            def directory_response(_directory, _method, path, body, **_kwargs):
+                if path == "/register-did/prepare":
+                    import time
+                    return {"request": {**body, "timestamp": "v2:0:" + str(int(time.time() * 1000) + 300000)},
+                            "payload_to_sign": "0x" + b"openpayload:register:v2|\x00\xff".hex()}
+                return {"tx_id": "test", "registration_status": "pending"}
+            with patch.object(did_tool, "request", side_effect=directory_response) as request, \
                  contextlib.redirect_stdout(io.StringIO()):
                 result = did_tool.main(["create", "--key-out", key, "--no-wait",
                                        "--relay-url", "https://relay.example.com",

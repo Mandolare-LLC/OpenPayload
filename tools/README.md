@@ -41,7 +41,19 @@ python3 tools/openpayload_did.py create \
 
 The key file is created with mode `0600` and will not overwrite an existing file. Keep it outside a repository and back it up securely. The default document contains a root verification method and authentication reference. Add `--key-agreement-public-key z...`, `--relay-url`, `--cache-url`, `--archive-url`, or `--services-file services.json` as needed. `--document-file document.json` supplies a complete document instead. Use `--did` to select a DID; otherwise a random canonical DID is generated. `--alias` is optional.
 
-Reuse an Ed25519 pair with `--private-key-file root.pem` and optionally `--public-key 0x...` or `--public-key-file root-public.pem`. To use a hardware or external signer, supply `--public-key`, `--timestamp`, and `--signature-base64`; sign the exact UTF-8 bytes `DID|timestamp`. The tool verifies that a supplied private and public key match.
+Reuse an Ed25519 pair with `--private-key-file root.pem` and optionally `--public-key 0x...` or `--public-key-file root-public.pem`. The tool verifies that a supplied private and public key match. Online creation first calls `POST /register-did/prepare`, signs the decoded binary `payload_to_sign` locally, then submits the returned request plus its Base64 signature. This requires a Directory and chain runtime supporting v2 DID proofs (runtime spec 125); there is no fallback to the old `DID|timestamp` signature. Preparation defaults to a five-minute expiry in `timestamp: "v2:0:<expiry-milliseconds>"`. This changes the signing proof, not key generation or the DID format.
+
+For a hardware or external signer, create `registration-input.json` containing `did`, `root_pubkey`, `did_document`, and optional `alias`, then run:
+
+```sh
+python3 tools/openpayload_did.py prepare-registration \
+  --request-file registration-input.json --output prepared-registration.json
+# Review request, decode payload_to_sign from hex, and sign those binary bytes externally.
+python3 tools/openpayload_did.py submit-prepared \
+  --prepared-file prepared-registration.json --signature-base64 SIGNATURE
+```
+
+Use the same `--directory-url` for both commands. Private keys never go in either JSON file. Submit before expiry; prepare and sign again if it expires. The former `create --timestamp --signature-base64` flow is replaced by this preparation flow.
 
 To create a complete public DID document without *any* network request:
 
@@ -87,7 +99,7 @@ Available groups and verbs are:
 
 For `verification-method`, `key-agreement`, and `service` add/update, `--data-file` is the JSON object for that component. Remove uses `--id`. Authentication uses `--id` for the referenced method. Alias update uses `--old-alias` and `--new-alias`. Device update uses `--device-id` and `--new-device-id`. Root rotation uses `--new-public-key`; retain the new private key before submitting. Deactivate and delete are alternative retirement paths: a deactivated DID cannot subsequently be deleted with a DID-key proof.
 
-External signers can call `prepare --did DID --request-file request.json --output prepared.json`, sign the decoded `payload_to_sign` bytes, then call `submit-prepared --prepared-file prepared.json --signature-base64 SIGNATURE`. The preparation file contains public data only. Submit before its authorization expiry and prepare again if its nonce becomes stale.
+External signers can call `prepare --did DID --request-file request.json --output prepared.json`, sign the decoded `payload_to_sign` bytes, then call `submit-prepared --prepared-file prepared.json --signature-base64 SIGNATURE`. Full document replacement also uses v2 proofs binding the encoded document and current document nonce; it still uses the same prepare/sign/submit workflow. The preparation file contains public data only. Submit before its authorization expiry and prepare again if its nonce becomes stale.
 
 ## Automation output
 

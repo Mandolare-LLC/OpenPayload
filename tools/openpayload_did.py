@@ -16,12 +16,12 @@ import secrets
 import ssl
 import sys
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
@@ -287,7 +287,7 @@ def parser_for():
     create = commands.add_parser("create", help="Build and register a DID, or save its document offline")
     common_write(create)
     for flag in ("did", "alias", "document-file", "public-key", "public-key-file",
-                 "private-key-file", "key-out", "signature-base64", "timestamp",
+                 "private-key-file", "key-out",
                  "key-agreement-public-key", "relay-url", "cache-url", "archive-url", "services-file"):
         create.add_argument("--" + flag)
     create.add_argument("--document-only", action="store_true")
@@ -324,6 +324,11 @@ def parser_for():
             target.add_argument("--device-id")
             target.add_argument("--new-device-id")
             target.add_argument("--new-public-key")
+    registration = commands.add_parser("prepare-registration", help="Prepare a DID registration for an external signer")
+    registration.add_argument("--directory-url", default=DIRECTORY)
+    registration.add_argument("--allow-insecure", action="store_true", help="Skip TLS certificate verification for CLI testing")
+    registration.add_argument("--request-file", required=True)
+    registration.add_argument("--output")
     prepare = commands.add_parser("prepare", help="Prepare an externally signed mutation from JSON")
     prepare.add_argument("--directory-url", default=DIRECTORY)
     prepare.add_argument("--allow-insecure", action="store_true", help="Skip TLS certificate verification for CLI testing")
@@ -366,6 +371,48 @@ def mutation_input(args) -> dict:
     return body
 
 
+def registration_payload(prepared: dict, expected: dict | None = None) -> bytes:
+    body = prepared["request"]
+    if not isinstance(body, dict) or set(body) - {"did", "alias", "root_pubkey", "did_document", "timestamp"}:
+        raise ValueError("unexpected registration preparation fields")
+    if body["did"] != body["did_document"]["id"]:
+        raise ValueError("prepared document id must match DID")
+    public_key(body["root_pubkey"])
+    parts = body["timestamp"].split(":")
+    if len(parts) != 3 or parts[:2] != ["v2", "0"] or not parts[2].isascii() or not parts[2].isdigit():
+        raise ValueError("registration requires a v2 nonce/expiry token")
+    until = int(parts[2])
+    now = int(time.time() * 1000)
+    if parts[2] != str(until) or not now < until <= now + 3600000:
+        raise ValueError("registration preparation is expired or exceeds one hour; prepare again")
+    if expected is not None:
+        for name in ("did", "root_pubkey", "did_document"):
+            if body.get(name) != expected.get(name):
+                raise ValueError("Directory changed the registration " + name)
+        alias = expected.get("alias")
+        if body.get("alias") != (alias.strip().lower() if alias else alias):
+            raise ValueError("Directory changed the registration alias")
+    encoded = prepared["payload_to_sign"]
+    if not isinstance(encoded, str) or not encoded.startswith("0x"):
+        raise ValueError("payload_to_sign must be 0x-prefixed hex")
+    payload = bytes.fromhex(encoded[2:])
+    if not payload.startswith(b"openpayload:register:v2|"):
+        raise ValueError("Directory did not prepare a v2 registration proof")
+    return payload
+
+
+def prepare_registration(directory: str, body: dict, *, allow_insecure=False) -> dict:
+    try:
+        prepared = request(directory, "POST", "/register-did/prepare", body,
+                           allow_insecure=allow_insecure)
+    except DirectoryError as error:
+        error.phase = "preparation"
+        error.did = body.get("did")
+        raise
+    registration_payload(prepared, body)
+    return prepared
+
+
 def prepare_mutation(directory: str, body: dict, *, allow_insecure=False) -> dict:
     return request(directory, "POST", "/dids/" + did_path(body["did"]) + "/prepare", body,
                    allow_insecure=allow_insecure)
@@ -373,9 +420,15 @@ def prepare_mutation(directory: str, body: dict, *, allow_insecure=False) -> dic
 
 def submit_mutation(directory: str, prepared: dict, signature: str, args) -> dict:
     body = dict(prepared["request"])
+    if "did_document" in body:
+        payload = registration_payload(prepared)
+        Ed25519PublicKey.from_public_bytes(public_key(body["root_pubkey"])).verify(
+            base64.b64decode(signature, validate=True), payload)
+        action, method, path = "create", "POST", "/register-did"
+    else:
+        action = prepared["action"]
+        method, path = endpoint(action, body)
     body["signature"] = signature
-    action = prepared["action"]
-    method, path = endpoint(action, body)
     try:
         response = request(directory, method, path, body, allow_insecure=getattr(args, "allow_insecure", False))
     except DirectoryError as error:
@@ -523,38 +576,21 @@ def create_did(args):
     if args.document_only:
         emit(document, args.output)
         return 0
-    timestamp = args.timestamp or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    if args.signature_base64 and not private and not args.timestamp:
-        raise ValueError("--timestamp is required with an external signature")
-    payload = (did + "|" + timestamp).encode("utf-8")
-    signature = base64.b64encode(private.sign(payload)).decode() if private else args.signature_base64
-    if signature is None:
-        raise ValueError("matching private key or --signature-base64 is required to submit")
-    body = {"did": did, "timestamp": timestamp, "signature": signature,
-            "root_pubkey": multibase(public), "did_document": document}
+    if private is None:
+        raise ValueError("use prepare-registration and submit-prepared with an external signer")
+    body = {"did": did, "root_pubkey": multibase(public), "did_document": document}
     if args.alias:
         body["alias"] = args.alias
+    prepared = prepare_registration(args.directory_url, body, allow_insecure=args.allow_insecure)
+    payload = registration_payload(prepared, body)
+    signature = base64.b64encode(private.sign(payload)).decode("ascii")
+    body = dict(prepared["request"])
+    body["signature"] = signature
     if args.interactive and sys.stdin.isatty():
         print(json.dumps(body, indent=2, sort_keys=True))
         if input("Submit this DID request? [y/N]: ").strip().lower() != "y":
             raise ValueError("Submission cancelled")
-    try:
-        response = request(args.directory_url, "POST", "/register-did", body,
-                           allow_insecure=args.allow_insecure)
-    except DirectoryError as error:
-        error.phase = "submission"
-        error.did = did
-        raise
-    tx = response.get("tx_id")
-    if not tx:
-        raise DirectoryError("Directory accepted registration without tx_id", details=response, phase="submission")
-    try:
-        result = wait_for(args.directory_url, "create", did, tx, args)
-    except DirectoryError as error:
-        error.phase = "status"
-        error.did = did
-        error.tx_id = tx
-        raise
+    result = submit_mutation(args.directory_url, prepared, signature, args)
     emit(result, args.output)
     return 2 if result["status"] == "timeout" else 0
 
@@ -576,6 +612,10 @@ def main(argv=None):
             if args.command == "nonces":
                 path += "/nonces"
             emit(request(args.directory_url, "GET", path, allow_insecure=args.allow_insecure), args.output)
+            return 0
+        if args.command == "prepare-registration":
+            body = read_json(args.request_file)
+            emit(prepare_registration(args.directory_url, body, allow_insecure=args.allow_insecure), args.output)
             return 0
         if args.command == "prepare":
             body = read_json(args.request_file)
@@ -614,7 +654,7 @@ def main(argv=None):
             result["tx_id"] = error.tx_id
         emit(result, getattr(args, "output", None))
         return 1
-    except (ValueError, OSError, KeyError, TypeError) as error:
+    except (ValueError, OSError, KeyError, TypeError, InvalidSignature) as error:
         emit({"status": "failed", "phase": "input", "error": str(error)}, getattr(args, "output", None))
         return 1
 
