@@ -338,10 +338,30 @@ It signs Directory-prepared bytes locally; it never performs SCALE encoding,
 chain RPC, or its own DNS lookup. It requires the sibling `openpayload_did.py`.
 Use Python on Linux or macOS for the cron and file-locking examples below.
 
-The new Directory release allows 48-hour DNS challenges and up to 365 days of
-verification. Recovery requires runtime **spec 124 or later** and the new
-Directory endpoints. These changes must be deployed before using recovery on
-alpha; installing the Python tool alone does not enable chain recovery.
+The DNSSEC migration requires runtime **spec 126** and the corresponding
+OpenDispatch release. It is prepared locally and has not been deployed. Installing
+this tool alone does not enable that runtime capability. Domain Personas require
+DNSSEC signing and a valid DS delegation from the parent registrar through to a
+configured DNS root trust anchor. Unsigned DNS and Directory attestations are
+rejected. Named Personas remain DNS-free.
+
+The Directory collects the complete signed TXT/key/delegation evidence and checks
+it using the finalized runtime verifier. It performs all SCALE encoding and RPC;
+no Directory account is an approved Persona attestor. The chain independently
+verifies the evidence and the operator DID signature when processing a mutation.
+
+DNSSEC algorithms 8, 10, 13 and 14 are supported. Delegated DS digests must use
+SHA-256 or SHA-384. The canonical domain is limited to 232 characters so its
+challenge name fits DNS limits. Algorithm 15, CNAME challenges,
+and wildcard challenges are unsupported. Publish an exact TXT record at the
+returned name. TXT signatures must be no more than 48 hours old. DNS challenges
+last 48 hours and verification defaults to 365 days; proof validity is also
+limited by DNS signature expiration. DID signing keys remain Ed25519.
+
+Existing confirmed domain Personas retain their stored lease. Renewals and
+transfers require fresh DNSSEC proof. Unfinished state files created by the old
+attestor model are rejected before network activity; start a new challenge with a
+new state-file path after upgrading, leaving the original file for reference.
 
 Register a domain Persona and save progress:
 
@@ -421,7 +441,7 @@ Common options:
 | `--output` | Save the JSON result to a file; `-` means stdout |
 | `--timeout` / `--poll-interval` | Default 600 seconds / 10 seconds |
 | `--interactive` / `--non-interactive` | Prompt for missing input, or never prompt |
-| `--allow-insecure` | Skip TLS verification for CLI testing |
+| `--allow-insecure` | Skip TLS verification for CLI testing; DNSSEC remains mandatory |
 
 Every run emits one JSON result. `--output` also saves that result. Exit code
 `0` covers confirmation, no renewal due, saved challenge, accepted submission,
@@ -437,7 +457,7 @@ Create a replacement DID first and publish its signing key. Then start recovery:
 ```sh
 python3 tools/openpayload_register.py persona recover \
   --name example.com --operator-did "$NEW_DID" --signing-key-file new-root.key \
-  --request-email --policy preserve --state-file recovery-state.json
+  --policy preserve --state-file recovery-state.json
 ```
 
 `--policy preserve` is the default. Recovery retains policy graph rules and
@@ -446,31 +466,18 @@ removes the Persona's V2 and V3 policies. Existing Persona delivery constraints
 remain in either mode. References to the old DID inside graphs are not rewritten.
 The new controller set is bound to the recovery request.
 
-The Directory sends the optional email challenge only to
-`openpayload-recovery@{domain}`. Put its token in a local file, then confirm and
-continue:
+Recovery requires fresh DNSSEC evidence and seven elapsed days. Controller
+cancellation records an objection and cannot veto or restart that window. The
+former email factor and immediate DNS-plus-email takeover are disabled: a
+Directory's mailbox observation cannot be independently verified by the chain.
+`--request-email`, `--email-only`, `--email-token-file`, and
+`persona recovery-confirm-email` fail before network activity.
 
-```sh
-python3 tools/openpayload_register.py resume \
-  --state-file recovery-state.json --email-token-file recovery-token.txt
-```
-
-`--email-token-file -` reads the token from stdin. The token is never saved in
-state or printed in the result. `resume --request-email` adds email proof to an
-existing DNS recovery. `--email-only` starts an email-only recovery.
-
-| Proofs | Completion |
-| --- | --- |
-| Fresh DNS and email | Immediate, including after controller cancellation |
-| Fresh DNS or email, plus seven elapsed days | Allowed, including after cancellation |
-| Neither proof | Never |
-
-A controller cancellation records an objection and cannot restart the timer.
-The timer begins with the first verified proof included in finalized chain
-state. DNS and email proofs last 48 hours, so a single-factor recovery must
-refresh proof near day seven. Resume preserves the original chain timer. A
-pending chain recovery expires after 14 days; expired entries are pruned when a
-new request is submitted, with at most eight pending requests per domain.
+The timer begins with the first verified request included in finalized chain
+state. DNS proofs last at most 48 hours and can expire sooner with their
+signatures, so refresh proof near day seven. Resume preserves the original chain
+timer. A pending chain recovery expires after 14 days; expired entries are pruned
+when a new request is submitted, with at most eight pending requests per domain.
 Directory challenges expire and are periodically purged after 48 hours.
 
 Status and controller objection commands:
@@ -483,20 +490,26 @@ python3 tools/openpayload_register.py persona recovery-cancel \
   --signing-key-file old-root.key
 ```
 
-`persona recovery-confirm-email` confirms a token separately, and
 `persona recovery-finalize` submits an eligible recovery explicitly. Ordinary
 `resume` handles proof refresh and finalization automatically. You can schedule
 `resume --state-file recovery-state.json --non-interactive` to check a pending
 recovery; it returns promptly during the seven-day window. DNS hooks are needed
-for unattended proof refresh; email-only refresh requires a newly delivered token.
+for unattended proof refresh.
 
 Recovery changes the Persona operator. It does not restore a lost DID key or
 transfer separately registered Application ownership. Single-label Personas
-cannot use domain or email recovery. DNS and email both depend on domain control;
-they are not independent factors against compromise of the DNS administration.
+cannot use domain recovery. No SMTP configuration can authorize chain changes
+in the DNSSEC model.
 
-The Directory operator must configure recovery email delivery. SMTP settings are
-`OPENPAYLOAD_RECOVERY_SMTP_HOST`, `OPENPAYLOAD_RECOVERY_SMTP_PORT` (default 587),
-`OPENPAYLOAD_RECOVERY_SMTP_USER`, `OPENPAYLOAD_RECOVERY_SMTP_PASSWORD`, and
-`OPENPAYLOAD_RECOVERY_EMAIL_FROM`. STARTTLS and server certificate validation are
-required. DNS-only recovery remains available without email delivery configured.
+Registration progress is printed to stderr and flushed immediately, including DNS verification, retry waits, accepted transaction IDs and uncertain submission outcomes. JSON results remain on stdout. Use `--quiet` to suppress progress for automation. `resume --no-wait` checks chain state once and returns the saved pending or unknown outcome without resubmitting it. DNS timeout results include the last Directory rejection.
+
+When waiting for DNS, each run prints the exact saved TXT name, value, and
+expiry once, including on resume. Publish the value for that state file; a
+challenge from an earlier attempt will not satisfy a replacement challenge.
+An already completed DNS publishing hook is not rerun merely to redisplay the
+instructions. `--quiet` suppresses these stderr instructions; the challenge
+remains available in the JSON result.
+
+Ctrl+C returns an `interrupted` JSON result and exit code 130, retaining the
+state file and DNS challenge for resume. If interrupted during submission, the
+script records an uncertain outcome and checks chain state before any retry.
