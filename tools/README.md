@@ -336,11 +336,20 @@ python3 -m unittest discover -s tools -p 'test_*.py'
 renews DNS verification, and recovers a domain Persona into a replacement DID.
 It signs Directory-prepared bytes locally; it never performs SCALE encoding,
 chain RPC, or its own DNS lookup. It requires the sibling `openpayload_did.py`.
-Use Python on Linux or macOS for the cron and file-locking examples below.
+This alpha CLI requires Python 3.9 or newer on Linux or macOS (it uses POSIX file
+locking). Registration and resume have been exercised against the alpha chain for
+`example.com`. Renewal and recovery have automated test coverage; they have not
+yet had the same live lifecycle exercise.
 
-The DNSSEC migration requires runtime **spec 126** and the corresponding
-OpenDispatch release. It is prepared locally and has not been deployed. Installing
-this tool alone does not enable that runtime capability. Domain Personas require
+Use a trusted Directory: the tool signs the canonical bytes it prepares, so the
+Directory must accurately encode your requested operation. Verify TLS in normal
+use; `--allow-insecure` is for controlled CLI testing. State files contain
+operation details, signatures, and key-file paths and are private local files.
+Keep state files, signing keys, and DNS provider credentials out of public repos.
+
+DNS registration requires runtime **spec 126 or newer**, the corresponding
+OpenDispatch release, and active DNS root trust anchors on chain. These
+capabilities are deployed on the alpha network. Domain Personas require
 DNSSEC signing and a valid DS delegation from the parent registrar through to a
 configured DNS root trust anchor. Unsigned DNS and Directory attestations are
 rejected. Named Personas remain DNS-free.
