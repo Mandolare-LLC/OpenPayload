@@ -6,7 +6,7 @@ them to compile and verify chain state. This source does not include operator
 infrastructure, signing material, launch ceremonies, or private deployment
 documentation.
 
-The current runtime source targets spec version 123. The included raw chain
+The current runtime source targets spec version 130. The included raw chain
 specification defines the permanent network genesis and advertises four current
 authority P2P bootnodes. It contains public chain data, not signing material.
 The raw spec contains the original genesis runtime; nodes follow the chain's
@@ -63,7 +63,7 @@ The development and local presets are only for disposable testing.
 ## Verify the source
 
 ```sh
-cargo test --locked --workspace
+cargo test --locked --workspace -- --skip query::tests::
 cargo clippy --locked --workspace --all-targets -- -D warnings
 ```
 
@@ -76,3 +76,8 @@ public issue.
 Project-authored source is released under the [Unlicense](LICENSE). The
 upstream-derived `runtime/src/genesis_config_presets.rs` retains its
 Apache-2.0 notice; see [LICENSE-APACHE](LICENSE-APACHE).
+
+The test command skips upstream live-DNS query tests; offline DNSSEC and
+cryptographic fixtures still run. Vendored dependencies retain their own
+licenses and patch notes under `vendor/`. See `RECONCILIATION.json` for
+the source revision and exported file checksums.

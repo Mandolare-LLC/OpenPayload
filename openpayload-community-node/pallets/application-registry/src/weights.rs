@@ -1,7 +1,9 @@
 use core::marker::PhantomData;
-use frame_support::{traits::Get, weights::Weight};
+use frame_support::weights::Weight;
 
 pub trait WeightInfo {
+    fn apply_application_with_proof() -> Weight;
+    fn authorize_application() -> Weight;
     fn register_application() -> Weight;
     fn update_application() -> Weight;
     fn set_application_status() -> Weight;
@@ -15,39 +17,53 @@ pub trait WeightInfo {
 pub struct SubstrateWeight<T>(PhantomData<T>);
 
 impl<T: frame_system::Config> SubstrateWeight<T> {
-    fn provisional() -> Weight {
-        T::BlockWeights::get().max_block.saturating_div(4)
+    // One annotation pays twice the full pool+dispatch envelope for all five
+    // operations, including two DID signatures, large records and index cleanup.
+    fn measured_envelope() -> Weight {
+        crate::measured_weights::SubstrateWeight::<T>::proof_envelope().saturating_mul(2)
     }
 }
 
 impl<T: frame_system::Config> WeightInfo for SubstrateWeight<T> {
+    fn apply_application_with_proof() -> Weight {
+        Self::measured_envelope()
+    }
+    fn authorize_application() -> Weight {
+        Self::measured_envelope()
+    }
     fn register_application() -> Weight {
-        Self::provisional()
+        Self::measured_envelope()
     }
     fn update_application() -> Weight {
-        Self::provisional()
+        Self::measured_envelope()
     }
     fn set_application_status() -> Weight {
-        Self::provisional()
+        Self::measured_envelope()
     }
     fn force_set_application_status() -> Weight {
-        Self::provisional()
+        Self::measured_envelope()
     }
     fn set_application_policy() -> Weight {
-        Self::provisional()
+        Self::measured_envelope()
     }
     fn clear_application_policy() -> Weight {
-        Self::provisional()
+        Self::measured_envelope()
     }
     fn set_application_domain() -> Weight {
-        Self::provisional()
+        Self::measured_envelope()
     }
     fn set_application_linked_did() -> Weight {
-        Self::provisional()
+        Self::measured_envelope()
     }
 }
 
 impl WeightInfo for () {
+    fn apply_application_with_proof() -> Weight {
+        Weight::MAX
+    }
+    fn authorize_application() -> Weight {
+        Weight::MAX
+    }
     fn register_application() -> Weight {
         Weight::MAX
     }

@@ -1,8 +1,10 @@
+// Typed-policy mutation tests below exercise cfg(test) frozen fixtures. Production
+// entry points are retired; opaque_tests verifies their rejection and the new path.
 use crate::{
     mock::*, CacheSelection, DeliveryConstraintOverrides, DeliveryPlanV1,
     DeliveryPolicy as DeliveryPolicyData, DeliveryPolicyV2, DeliveryStep, DeliveryStepOperation,
     DeliveryStepOperationView, DidDeliveryConstraints, DidOf, DidPoliciesV2, Error,
-    ExpirationBehavior, PersonaAttestationPayload, PersonaAuthorizationPayload, PersonaOf,
+    ExpirationBehavior, PersonaAuthorizationPayload, PersonaOf,
     PersonaOperation, PersonaOperatorNonces, PersonaPolicies, PersonaPoliciesV2,
     PersonaTransferAcceptancePayload, Personas, PolicyAction, PolicyActionV2, PolicyActionView,
     PolicyAuthorizationPayload, PolicyCondition, PolicyIdOf, PolicyNonces, PolicyRule,
@@ -41,9 +43,7 @@ fn v3_application_call_requires_a_domain_owned_by_its_control_did() {
         let step = DeliveryStep::<Test> {
             id: rule_id(b"call"),
             operation: DeliveryStepOperation::Call {
-                service_did: did(b"did:service"),
-                service_id: b"did:service#control".to_vec().try_into().unwrap(),
-                registered_domain: domain.clone(),
+                url: b"https://api.push.example.com/v1/calls".to_vec().try_into().unwrap(),
                 payload_template: br#"{"action":"sendPush"}"#.to_vec().try_into().unwrap(),
             },
         };
@@ -81,7 +81,7 @@ fn v3_application_call_requires_a_domain_owned_by_its_control_did() {
         }
         .encode();
         assert_noop!(
-            DeliveryPolicy::apply_policy_v3_with_proof(
+            DeliveryPolicy::legacy_fixture_apply_policy_v3_with_proof(
                 RuntimeOrigin::none(),
                 proof.clone(),
                 proof.clone(),
@@ -93,7 +93,7 @@ fn v3_application_call_requires_a_domain_owned_by_its_control_did() {
         inactive.active = false;
         Personas::<Test>::insert(&domain, inactive);
         assert_noop!(
-            DeliveryPolicy::apply_policy_v3_with_proof(
+            DeliveryPolicy::legacy_fixture_apply_policy_v3_with_proof(
                 RuntimeOrigin::none(),
                 proof.clone(),
                 proof.clone(),
@@ -102,7 +102,22 @@ fn v3_application_call_requires_a_domain_owned_by_its_control_did() {
             Error::<Test>::InvalidCallDomain
         );
         Personas::<Test>::insert(&domain, make_registration(b"did:alice"));
-        assert_ok!(DeliveryPolicy::apply_policy_v3_with_proof(
+        for url in [b"https://evilpush.example.com/v1/calls".as_slice(),
+            b"https://push.example.com.evil.chat/v1/calls", b"http://push.example.com/v1/calls"] {
+            let mut invalid = policy.clone();
+            if let PolicyActionV2::DeliveryPlanV1(plan) = &mut invalid.ruleset[0].action {
+                if let DeliveryStepOperation::Call { url: target, .. } = &mut plan.steps[0].operation {
+                    *target = url.to_vec().try_into().unwrap();
+                }
+            }
+            let invalid_proof = crate::PolicyV3AuthorizationPayload::<Test> {
+                operator_did: did(b"did:alice"), operation: crate::PolicyV3Operation::SetPolicy(invalid),
+                nonce: 0, valid_until: 5_000, signer_key_id: b"did:alice#keys-1".to_vec().try_into().unwrap(),
+            }.encode();
+            assert_noop!(DeliveryPolicy::legacy_fixture_apply_policy_v3_with_proof(RuntimeOrigin::none(),
+                invalid_proof.clone(), invalid_proof, b"did:alice#keys-1".to_vec()), Error::<Test>::InvalidCallDomain);
+        }
+        assert_ok!(DeliveryPolicy::legacy_fixture_apply_policy_v3_with_proof(
             RuntimeOrigin::none(),
             proof.clone(),
             proof,
@@ -110,6 +125,37 @@ fn v3_application_call_requires_a_domain_owned_by_its_control_did() {
         ));
         assert_eq!(crate::PoliciesV3::<Test>::iter_keys().count(), 1);
     });
+}
+
+#[test]
+fn call_variant_four_encodes_only_url_and_payload() {
+    let operation = DeliveryStepOperation::<Test>::Call {
+        url: b"https://api.talaria.chat/v1/calls".to_vec().try_into().unwrap(),
+        payload_template: b"{}".to_vec().try_into().unwrap(),
+    };
+    let mut expected = vec![4, 132]; // variant 4, compact length 33
+    expected.extend_from_slice(b"https://api.talaria.chat/v1/calls");
+    expected.extend_from_slice(&[8, b'{', b'}']);
+    assert_eq!(operation.encode(), expected);
+}
+
+#[cfg(feature = "try-runtime")]
+#[test]
+fn url_call_upgrade_precheck_rejects_nonempty_policy_maps_without_decoding_values() {
+    for item in 0..3 {
+        new_test_ext().execute_with(|| {
+            StorageVersion::new(6).put::<DeliveryPolicy>();
+            assert!(DeliveryPolicy::pre_upgrade().is_ok());
+            let key = match item {
+                0 => DidPoliciesV2::<Test>::hashed_key_for(did(b"did:alice")),
+                1 => PersonaPoliciesV2::<Test>::hashed_key_for(persona(b"example.com")),
+                _ => crate::PoliciesV3::<Test>::hashed_key_for(crate::PolicyScopeV3::<Test>::Application(
+                    b"talaria".to_vec().try_into().unwrap())),
+            };
+            sp_io::storage::set(&key, b"old policy encoding");
+            assert!(DeliveryPolicy::pre_upgrade().is_err());
+        });
+    }
 }
 use codec::Encode;
 use frame_support::{
@@ -119,48 +165,251 @@ use frame_support::{
 };
 use sp_runtime::traits::Hash;
 
+fn dnssec_key(zone: &str, seed: u8) -> (p256::ecdsa::SigningKey, dnssec_prover::rr::DnsKey) {
+    let signer = p256::ecdsa::SigningKey::from_bytes((&[seed; 32]).into()).unwrap();
+    let public = signer.verifying_key().to_encoded_point(false);
+    let key = dnssec_prover::rr::DnsKey { name: zone.try_into().unwrap(), flags: 257,
+        protocol: 3, alg: 13, pubkey: public.as_bytes()[1..].to_vec() };
+    (signer, key)
+}
+
+fn dnssec_ds(key: &dnssec_prover::rr::DnsKey) -> dnssec_prover::rr::DS {
+    use dnssec_prover::rr::Record;
+    let mut rdata = Vec::new(); key.write_u16_len_prefixed_data(&mut rdata);
+    let mut material = Vec::new(); dnssec_prover::ser::write_rr(key, 300, &mut material);
+    let name_len = material.len() - rdata.len() - 8;
+    let mut input = material[..name_len].to_vec(); input.extend_from_slice(&rdata[2..]);
+    dnssec_prover::rr::DS { name: key.name.clone(), key_tag: key.key_tag(), alg: 13,
+        digest_type: 2, digest: sp_io::hashing::sha2_256(&input).to_vec() }
+}
+
+fn dnssec_sign<R: dnssec_prover::rr::Record>(record: &R, key: &dnssec_prover::rr::DnsKey,
+    signer: &p256::ecdsa::SigningKey, inception: u32, expiration: u32) -> dnssec_prover::rr::RRSig {
+    use dnssec_prover::rr::Record;
+    use p256::ecdsa::signature::Signer;
+    let mut sig = dnssec_prover::rr::RRSig { name: record.name().clone(), ty: record.ty(),
+        alg: 13, labels: record.name().as_str().split('.').filter(|part| !part.is_empty()).count() as u8,
+        orig_ttl: 300, expiration, inception, key_tag: key.key_tag(), key_name: key.name.clone(), signature: Vec::new() };
+    let mut header = Vec::new(); sig.write_u16_len_prefixed_data(&mut header);
+    let mut input = header[2..].to_vec(); dnssec_prover::ser::write_rr(record, 300, &mut input);
+    let signature: p256::ecdsa::Signature = signer.sign(&input);
+    sig.signature = signature.to_bytes().to_vec(); sig
+}
+
+fn install_test_dnssec_root() {
+    let (_, root) = dnssec_key(".", 42);
+    let ds = dnssec_ds(&root);
+    assert_ok!(DeliveryPolicy::set_dnssec_root_trust_anchor(RuntimeOrigin::root(), ds.key_tag,
+        crate::DnssecRootTrustAnchor { algorithm: 13, digest: ds.digest.try_into().unwrap(), valid_from: 0, valid_until: 0 }));
+}
+
+#[test]
+fn dnssec_preflight_rejects_unsigned_forged_expired_and_untrusted_records() {
+    new_test_ext().execute_with(|| {
+        Timestamp::set_timestamp(1_700_000_100_000);
+        let name = "_openpayload-persona.example.com.";
+        let value = b"a request-bound challenge";
+        let proof = signed_dnssec_txt(name, value, 1_700_000_001, 1_700_001_000);
+        assert_eq!(DeliveryPolicy::verify_dnssec_txt(name.as_bytes().to_vec(), value.to_vec(), proof.clone()), None);
+        install_test_dnssec_root();
+        let (_, root) = dnssec_key(".", 42);
+        let records = dnssec_prover::ser::parse_rr_stream(&proof).unwrap();
+        let checked = dnssec_prover::validation::verify_rr_stream_with_trust_anchors(&records, &[dnssec_ds(&root)]);
+        assert!(checked.is_ok(), "upstream proof check: {checked:?}");
+        assert_eq!(DeliveryPolicy::verify_dnssec_txt(name.as_bytes().to_vec(), value.to_vec(), proof.clone()), Some(1_700_001_000_000));
+        assert_eq!(DeliveryPolicy::verify_dnssec_txt(name.as_bytes().to_vec(), b"forged".to_vec(), proof.clone()), None);
+        let mut corrupted = proof.clone(); let last = corrupted.len() - 1; corrupted[last] ^= 1;
+        assert_eq!(DeliveryPolicy::verify_dnssec_txt(name.as_bytes().to_vec(), value.to_vec(), corrupted), None);
+        assert_eq!(DeliveryPolicy::verify_dnssec_txt(name.as_bytes().to_vec(), value.to_vec(), vec![0; 65537]), None);
+        Timestamp::set_timestamp(1_700_001_000_000);
+        assert_eq!(DeliveryPolicy::verify_dnssec_txt(name.as_bytes().to_vec(), value.to_vec(), proof), None);
+    });
+}
+
+#[test]
+fn dnssec_root_management_requires_governance_and_honors_activation_retirement() {
+    new_test_ext().execute_with(|| {
+        let (_, root) = dnssec_key(".", 42); let ds = dnssec_ds(&root);
+        let anchor = crate::DnssecRootTrustAnchor { algorithm: 13, digest: ds.digest.try_into().unwrap(), valid_from: 1_700_000_010_000, valid_until: 1_700_000_020_000 };
+        assert!(DeliveryPolicy::set_dnssec_root_trust_anchor(RuntimeOrigin::signed(1), ds.key_tag, anchor.clone()).is_err());
+        assert_ok!(DeliveryPolicy::set_dnssec_root_trust_anchor(RuntimeOrigin::root(), ds.key_tag, anchor));
+        let name = "_openpayload-persona.example.com."; let value = b"challenge";
+        let proof = signed_dnssec_txt(name, value, 1_700_000_000, 2_000_000_000);
+        let verify = || DeliveryPolicy::verify_dnssec_txt(name.as_bytes().to_vec(), value.to_vec(), proof.clone());
+        Timestamp::set_timestamp(1_700_000_009_999); assert_eq!(verify(), None);
+        Timestamp::set_timestamp(1_700_000_010_000); assert_eq!(verify(), Some(1_700_000_000_000 + 48 * 3_600_000));
+        Timestamp::set_timestamp(1_700_000_020_000); assert_eq!(verify(), None);
+        assert_noop!(DeliveryPolicy::set_persona_attestor(RuntimeOrigin::root(), 99, true), Error::<Test>::DnssecRequired);
+        assert_ok!(DeliveryPolicy::remove_dnssec_root_trust_anchor(RuntimeOrigin::root(), ds.key_tag));
+        assert!(crate::DnssecRootTrustAnchors::<Test>::iter_keys().next().is_none());
+    });
+}
+
+#[test]
+fn dnssec_persona_registration_and_renewal_bind_did_action_nonce_and_genesis() {
+    new_test_ext().execute_with(|| {
+        Timestamp::set_timestamp(1_700_000_010_000); install_test_dnssec_root();
+        let name = persona(b"example.com"); let owner = did(b"did:alice");
+        let expiry = 1_700_001_000_000;
+        let (hash, proof) = dnssec_evidence(&name, &owner, b"register_persona", 0, expiry, &[0; 32]);
+        let register = |proof_hash, evidence| DeliveryPolicy::register_persona(RuntimeOrigin::signed(1),
+            name.to_vec(), owner.to_vec(), vec![b"did:alice#root".to_vec()], 1, None,
+            proof_hash, 0, 1_700_002_000_000, expiry, evidence);
+        assert_noop!(register([1; 32], proof.clone()), Error::<Test>::InvalidDnssecProof);
+        let (_, wrong_action) = dnssec_evidence(&name, &owner, b"renew_persona", 0, expiry, &[0; 32]);
+        assert_noop!(register(hash, wrong_action), Error::<Test>::InvalidDnssecProof);
+        let (_, other_did) = dnssec_evidence(&name, &did(b"did:bob"), b"register_persona", 0, expiry, &[0; 32]);
+        assert_noop!(register(hash, other_did), Error::<Test>::InvalidDnssecProof);
+        assert_ok!(register(hash, proof.clone()));
+        assert_noop!(register(hash, proof.clone()), Error::<Test>::PersonaAlreadyExists);
+        assert_noop!(DeliveryPolicy::renew_persona(RuntimeOrigin::signed(1), name.to_vec(), None,
+            hash, 0, 1_700_002_000_000, expiry, proof), Error::<Test>::InvalidPersonaNonce);
+        let (hash, proof) = dnssec_evidence(&name, &owner, b"renew_persona", 1, expiry, &[0; 32]);
+        assert_ok!(DeliveryPolicy::renew_persona(RuntimeOrigin::signed(1), name.to_vec(), None,
+            hash, 1, 1_700_002_000_000, expiry, proof));
+        assert_eq!(crate::PersonaNonces::<Test>::get(&name), 2);
+    });
+}
+
+fn recovery_dnssec_proof(name: &PersonaOf<Test>, id: [u8; 32]) -> crate::PersonaRecoveryProof {
+    let expires = Timestamp::get() + 48 * 3_600_000;
+    let nonce = crate::PersonaNonces::<Test>::get(name);
+    let (hash, proof) = dnssec_evidence(name, &did(b"did:bob"), b"recover_persona", nonce, expires, &id);
+    crate::PersonaRecoveryProof { factors: 1, proof_hash: hash, proof_valid_until: expires,
+        verification_expires_at: Timestamp::get() + 365 * 86_400_000, challenge_nonce: nonce,
+        challenge_expires_at: expires, dnssec_proof: proof }
+}
+
+#[test]
+fn dnssec_recovery_requires_delay_fresh_proof_and_preserves_or_clears_policy() {
+    for preserve in [true, false] {
+        new_test_ext().execute_with(|| {
+            Timestamp::set_timestamp(1_700_000_010_000); install_test_dnssec_root();
+            let name = recovery_registration(); let id = [7; 32];
+            let policy = policy_v2(PolicyScopeV2::Persona(name.clone()), b"did:alice", 4,
+                vec![base_rule(b"preserve-rule", 1, Vec::new())]);
+            PersonaPoliciesV2::<Test>::insert(&name, policy.clone());
+            let scope = crate::PolicyScopeV3::Persona(name.clone());
+            let mut id_material = b"openpayload:delivery-policy:v3:".to_vec(); id_material.extend_from_slice(&scope.encode());
+            let graph = crate::DeliveryPolicyV3::<Test> {
+                policy_id: <Test as frame_system::Config>::Hashing::hash(&id_material).as_ref().to_vec().try_into().unwrap(),
+                scope: scope.clone(), operator_did: did(b"did:alice"), revision: 9,
+                ruleset: vec![base_rule(b"edited-v3-graph", 7, Vec::new())].try_into().unwrap(), policy_ttl_seconds: 90,
+            };
+            crate::PoliciesV3::<Test>::insert(&scope, graph.clone());
+            let raw=crate::PolicyDocumentRecord::<Test> { revision:12,operator_did:did(b"did:alice"),content_hash:sp_io::hashing::blake2_256(b"opaque bytes"),document:b"opaque bytes".to_vec().try_into().unwrap() };
+            crate::PoliciesV4::<Test>::insert(&scope,raw.clone());
+            let start = |proof| PersonaOperation::StartRecovery { persona: name.clone(), recovery_id: id,
+                controller_key_ids: vec![b"did:bob#root".to_vec().try_into().unwrap()].try_into().unwrap(),
+                controller_threshold: 1, preserve_policy: preserve, proof };
+            let mut email = recovery_dnssec_proof(&name, id); email.factors = 3;
+            assert_noop!(recovery_call(b"did:bob", start(email)), Error::<Test>::InvalidRecoveryProof);
+            assert_ok!(recovery_call(b"did:bob", start(recovery_dnssec_proof(&name, id))));
+            // Legacy records have the same layout but no DNSSEC admission marker.
+            crate::DnssecRecoveryIds::<Test>::remove(&name, id);
+            assert_noop!(recovery_call(b"did:bob", PersonaOperation::ProveRecovery { persona: name.clone(),
+                recovery_id: id, proof: recovery_dnssec_proof(&name, id) }), Error::<Test>::DnssecRequired);
+            crate::DnssecRecoveryIds::<Test>::insert(&name, id, ());
+            assert_ok!(recovery_call(b"did:alice", PersonaOperation::CancelRecovery { persona: name.clone(), recovery_id: id }));
+            assert_noop!(recovery_call(b"did:bob", PersonaOperation::FinalizeRecovery { persona: name.clone(), recovery_id: id }), Error::<Test>::RecoveryNotReady);
+            Timestamp::set_timestamp(1_700_000_010_000 + 7 * 86_400_000);
+            assert_noop!(recovery_call(b"did:bob", PersonaOperation::FinalizeRecovery { persona: name.clone(), recovery_id: id }), Error::<Test>::RecoveryNotReady);
+            assert_ok!(recovery_call(b"did:bob", PersonaOperation::ProveRecovery { persona: name.clone(), recovery_id: id, proof: recovery_dnssec_proof(&name, id) }));
+            assert_ok!(recovery_call(b"did:bob", PersonaOperation::FinalizeRecovery { persona: name.clone(), recovery_id: id }));
+            assert_eq!(Personas::<Test>::get(&name).unwrap().operator_did, did(b"did:bob"));
+            assert!(crate::PersonaRecoveryIds::<Test>::get(&name).is_empty());
+            assert!(!crate::DnssecRecoveryIds::<Test>::contains_key(&name, id));
+            let current_raw=crate::PoliciesV4::<Test>::get(&scope).unwrap();
+            if preserve {
+                let mut expected_raw=raw;expected_raw.operator_did=did(b"did:bob");
+                assert_eq!(current_raw,expected_raw);
+                let mut expected = policy; expected.operator_did = did(b"did:bob");
+                assert_eq!(PersonaPoliciesV2::<Test>::get(&name), Some(expected));
+                let mut expected_graph = graph; expected_graph.operator_did = did(b"did:bob");
+                assert_eq!(crate::PoliciesV3::<Test>::get(&scope), Some(expected_graph));
+            } else {
+                assert!(current_raw.document.is_empty());assert_eq!(current_raw.revision,13);
+                assert_eq!(current_raw.content_hash,sp_io::hashing::blake2_256(&[]));
+                assert!(PersonaPoliciesV2::<Test>::get(&name).is_none());
+                assert!(crate::PoliciesV3::<Test>::get(&scope).is_none());
+            }
+        });
+    }
+}
+
+fn signed_dnssec_txt(name: &str, value: &[u8], inception: u32, expiration: u32) -> Vec<u8> {
+    let zone = name.split_once('.').unwrap().1;
+    signed_dnssec_txt_in_zone(name, value, inception, expiration, zone)
+}
+
+fn signed_dnssec_txt_in_zone(name: &str, value: &[u8], inception: u32, expiration: u32, zone: &str) -> Vec<u8> {
+    use dnssec_prover::rr::{Txt, RR};
+    let (root_signer, root) = dnssec_key(".", 42);
+    let (child_signer, child) = dnssec_key(zone, 43);
+    let ds = dnssec_ds(&child);
+    let txt = Txt { name: name.try_into().unwrap(), data: value.try_into().unwrap() };
+    let records = vec![
+        RR::RRSig(dnssec_sign(&root, &root, &root_signer, inception, expiration)), RR::DnsKey(root.clone()),
+        RR::RRSig(dnssec_sign(&ds, &root, &root_signer, inception, expiration)), RR::DS(ds),
+        RR::RRSig(dnssec_sign(&child, &child, &child_signer, inception, expiration)), RR::DnsKey(child.clone()),
+        RR::RRSig(dnssec_sign(&txt, &child, &child_signer, inception, expiration)), RR::Txt(txt),
+    ];
+    let mut wire = Vec::new(); for rr in records { dnssec_prover::ser::write_rr(&rr, 300, &mut wire); }
+    wire
+}
+
+fn dnssec_evidence(persona: &PersonaOf<Test>, operator: &DidOf<Test>, action: &[u8], nonce: u64,
+    expires: u64, id: &[u8; 32]) -> ([u8; 32], BoundedVec<u8, frame_support::traits::ConstU32<65536>>) {
+    let value = crate::dnssec::challenge_value(System::block_hash(0u64).as_ref(), persona, operator,
+        action, nonce, expires, id);
+    let mut name = b"_openpayload-persona.".to_vec(); name.extend_from_slice(persona);
+    let mut material = name.clone(); material.push(b'\n'); material.extend_from_slice(&value);
+    name.push(b'.');
+    let proof = signed_dnssec_txt(core::str::from_utf8(&name).unwrap(), &value, (Timestamp::get() / 1000) as u32, 2_000_000_000);
+    (sp_io::hashing::sha2_256(&material), proof.try_into().unwrap())
+}
+
+// Policy tests seed an already-confirmed Persona. DNSSEC admission is covered separately.
+fn seed_persona_fixture(origin: RuntimeOrigin, raw_persona: Vec<u8>, raw_operator: Vec<u8>,
+    controllers: Vec<Vec<u8>>, threshold: u8, constraints: Option<RequestedDeliveryConstraints>, expiry: u64)
+    -> frame_support::dispatch::DispatchResult {
+    let canonical = String::from_utf8(raw_persona).unwrap().trim_end_matches('.').to_ascii_lowercase();
+    if !canonical.contains('.') { return Err(Error::<Test>::InvalidPersona.into()); }
+    let name = persona(canonical.as_bytes()); let operator = did(&raw_operator);
+    let record = crate::PersonaRecord::<Test> { operator_did: operator,
+        controller_key_ids: controllers.into_iter().map(|key| key.try_into().unwrap()).collect::<Vec<_>>().try_into().unwrap(),
+        controller_threshold: threshold, delivery_constraints: None, dns_proof_hash: [0; 32],
+        verified_at: Timestamp::get(), verification_expires_at: expiry, revision: 1, active: true };
+    Personas::<Test>::insert(&name, record);
+    if let Some(constraints) = constraints {
+        DeliveryPolicy::set_persona_delivery_constraints(origin, name.to_vec(), constraints)?;
+        Personas::<Test>::mutate(&name, |record| record.as_mut().unwrap().revision = 1);
+    }
+    Ok(())
+}
+
 #[test]
 fn named_persona_is_active_without_dns_and_cannot_claim_a_domain() {
     new_test_ext().execute_with(|| {
         let name = b"compliance".to_vec();
         assert_ok!(DeliveryPolicy::register_named_persona(
-            RuntimeOrigin::signed(1),
-            name.clone(),
-            b"did:alice".to_vec(),
-            vec![b"did:alice#keys-1".to_vec()],
-            1,
-            None
-        ));
+            RuntimeOrigin::signed(1), name.clone(), b"did:alice".to_vec(),
+            vec![b"did:alice#keys-1".to_vec()], 1, None));
         let key = persona(&name);
         assert!(crate::NonDnsPersonas::<Test>::contains_key(&key));
         assert!(Personas::<Test>::get(&key).unwrap().active);
-        assert_noop!(
-            DeliveryPolicy::register_named_persona(
-                RuntimeOrigin::signed(1),
-                b"example.com".to_vec(),
-                b"did:alice".to_vec(),
-                vec![b"did:alice#keys-1".to_vec()],
-                1,
-                None
-            ),
-            Error::<Test>::InvalidPersona
-        );
-        assert_noop!(
-            DeliveryPolicy::register_persona(
-                RuntimeOrigin::signed(1),
-                b"compliance".to_vec(),
-                b"did:alice".to_vec(),
-                vec![b"did:alice#keys-1".to_vec()],
-                1,
-                None,
-                [1; 32],
-                0,
-                10_000,
-                1,
-                Vec::new()
-            ),
-            Error::<Test>::InvalidPersona
-        );
+        assert_noop!(DeliveryPolicy::register_named_persona(
+            RuntimeOrigin::signed(1), b"example.com".to_vec(), b"did:alice".to_vec(),
+            vec![b"did:alice#keys-1".to_vec()], 1, None),
+            Error::<Test>::InvalidPersona);
+        assert_noop!(seed_persona_fixture(RuntimeOrigin::signed(1),
+            b"compliance".to_vec(),
+            b"did:alice".to_vec(),
+            vec![b"did:alice#keys-1".to_vec()],
+            1,
+            None,
+            10_000),
+            Error::<Test>::InvalidPersona);
     });
 }
 
@@ -173,24 +422,18 @@ fn named_persona_accepts_did_signed_proof_and_consumes_nonce() {
             operator_did: did(b"did:alice"),
             operation: PersonaOperation::RegisterNamed {
                 persona: persona(b"compliance"),
-                controller_key_ids: vec![signer.clone().try_into().unwrap()].try_into().unwrap(),
+                controller_key_ids: vec![signer.clone().try_into().unwrap()]
+                    .try_into().unwrap(),
                 controller_threshold: 1,
                 constraints: None,
             },
             nonce: 0,
             valid_until: 5_000,
             signer_key_id: signer.clone().try_into().unwrap(),
-        }
-        .encode();
+        }.encode();
         assert_ok!(DeliveryPolicy::apply_persona_with_proof(
-            RuntimeOrigin::none(),
-            proof.clone(),
-            proof,
-            signer
-        ));
-        assert!(crate::NonDnsPersonas::<Test>::contains_key(persona(
-            b"compliance"
-        )));
+            RuntimeOrigin::none(), proof.clone(), proof, signer));
+        assert!(crate::NonDnsPersonas::<Test>::contains_key(persona(b"compliance")));
         assert_eq!(PersonaOperatorNonces::<Test>::get(did(b"did:alice")), 1);
     });
 }
@@ -199,21 +442,13 @@ fn named_persona_accepts_did_signed_proof_and_consumes_nonce() {
 fn persona_profile_requires_a_recipient_route() {
     new_test_ext().execute_with(|| {
         assert_ok!(DeliveryPolicy::register_named_persona(
-            RuntimeOrigin::signed(1),
-            b"compliance".to_vec(),
-            b"did:alice".to_vec(),
-            vec![b"did:alice#keys-1".to_vec()],
-            1,
-            None
-        ));
+            RuntimeOrigin::signed(1), b"compliance".to_vec(), b"did:alice".to_vec(),
+            vec![b"did:alice#keys-1".to_vec()], 1, None));
         let scope = crate::PolicyScopeV3::Persona(persona(b"compliance"));
         let mut id_input = b"openpayload:delivery-policy:v3:".to_vec();
         id_input.extend_from_slice(&scope.encode());
         let policy_id = <Test as frame_system::Config>::Hashing::hash(&id_input)
-            .as_ref()
-            .to_vec()
-            .try_into()
-            .unwrap();
+            .as_ref().to_vec().try_into().unwrap();
         let profile = DeliveryStep::<Test> {
             id: rule_id(b"profile"),
             operation: DeliveryStepOperation::RequireProfile,
@@ -224,73 +459,46 @@ fn persona_profile_requires_a_recipient_route() {
             transitions: Vec::new().try_into().unwrap(),
         };
         let mut policy = crate::DeliveryPolicyV3::<Test> {
-            policy_id,
-            scope,
-            revision: 1,
-            operator_did: did(b"did:alice"),
+            policy_id, scope, revision: 1, operator_did: did(b"did:alice"),
             ruleset: vec![PolicyRule {
-                id: rule_id(b"gate"),
-                priority: 1,
-                conditions: BoundedVec::default(),
+                id: rule_id(b"gate"), priority: 1, conditions: BoundedVec::default(),
                 action: PolicyActionV2::DeliveryPlanV1(plan.clone()),
                 constraint_overrides: None,
-            }]
-            .try_into()
-            .unwrap(),
+            }].try_into().unwrap(),
             policy_ttl_seconds: 60,
         };
         let authorize = |policy: crate::DeliveryPolicyV3<Test>| {
             crate::PolicyV3AuthorizationPayload::<Test> {
                 operator_did: did(b"did:alice"),
                 operation: crate::PolicyV3Operation::SetPolicy(policy),
-                nonce: 0,
-                valid_until: 5_000,
+                nonce: 0, valid_until: 5_000,
                 signer_key_id: b"did:alice#keys-1".to_vec().try_into().unwrap(),
-            }
-            .encode()
+            }.encode()
         };
         let proof = authorize(policy.clone());
-        assert_noop!(
-            DeliveryPolicy::apply_policy_v3_with_proof(
-                RuntimeOrigin::none(),
-                proof.clone(),
-                proof.clone(),
-                b"did:alice#keys-1".to_vec()
-            ),
-            Error::<Test>::InvalidDeliveryPlan
-        );
+        assert_noop!(DeliveryPolicy::legacy_fixture_apply_policy_v3_with_proof(
+            RuntimeOrigin::none(), proof.clone(), proof.clone(),
+            b"did:alice#keys-1".to_vec()), Error::<Test>::InvalidDeliveryPlan);
 
-        plan.steps
-            .try_push(DeliveryStep {
-                id: rule_id(b"deliver"),
-                operation: DeliveryStepOperation::Forward {
-                    targets: vec![RouteTarget::<Test> {
-                        service_did: did(b"did:relay"),
-                        service_id: b"relay-primary".to_vec().try_into().unwrap(),
-                        priority: 1,
-                        weight: 1,
-                    }]
-                    .try_into()
-                    .unwrap(),
-                },
-            })
-            .unwrap();
-        plan.transitions
-            .try_push(crate::DeliveryTransition::<Test> {
-                from: rule_id(b"profile"),
-                to: rule_id(b"deliver"),
-                trigger: TransitionTrigger::Success,
-                mode: TransitionMode::Next,
-            })
-            .unwrap();
+        plan.steps.try_push(DeliveryStep {
+            id: rule_id(b"deliver"),
+            operation: DeliveryStepOperation::Forward {
+                targets: vec![RouteTarget::<Test> {
+                    service_did: did(b"did:relay"),
+                    service_id: b"relay-primary".to_vec().try_into().unwrap(),
+                    priority: 1, weight: 1,
+                }].try_into().unwrap(),
+            },
+        }).unwrap();
+        plan.transitions.try_push(crate::DeliveryTransition::<Test> {
+            from: rule_id(b"profile"), to: rule_id(b"deliver"),
+            trigger: TransitionTrigger::Success, mode: TransitionMode::Next,
+        }).unwrap();
         policy.ruleset[0].action = PolicyActionV2::DeliveryPlanV1(plan);
         let proof = authorize(policy);
-        assert_ok!(DeliveryPolicy::apply_policy_v3_with_proof(
-            RuntimeOrigin::none(),
-            proof.clone(),
-            proof,
-            b"did:alice#keys-1".to_vec()
-        ));
+        assert_ok!(DeliveryPolicy::legacy_fixture_apply_policy_v3_with_proof(
+            RuntimeOrigin::none(), proof.clone(), proof,
+            b"did:alice#keys-1".to_vec()));
     });
 }
 
@@ -366,32 +574,9 @@ fn base_rule(id: &[u8], priority: u32, conditions: Vec<PolicyCondition<Test>>) -
     }
 }
 
-fn persona_attestation(
-    persona: &PersonaOf<Test>,
-    operator_did: &DidOf<Test>,
-    proof: [u8; 32],
-    nonce: u64,
-    expires_at: u64,
-) -> Vec<u8> {
-    PersonaAttestationPayload::<Test> {
-        domain: BoundedVec::truncate_from(b"openpayload:persona:dns:v1".to_vec()),
-        genesis_hash: System::block_hash(0u64),
-        persona: persona.clone(),
-        operator_did: operator_did.clone(),
-        dns_proof_hash: proof,
-        challenge_nonce: nonce,
-        verification_expires_at: expires_at,
-    }
-    .encode()
-}
 
-fn approve_attestor(account: u64) {
-    assert_ok!(DeliveryPolicy::set_persona_attestor(
-        RuntimeOrigin::root(),
-        account,
-        true,
-    ));
-}
+
+
 
 fn signed_policy_payload(
     did_value: &[u8],
@@ -423,7 +608,7 @@ fn all_legacy_v1_policy_writes_are_deprecated() {
             Error::<Test>::LegacyPolicyDeprecated
         );
         assert_noop!(
-            DeliveryPolicy::set_tag_policy(
+            DeliveryPolicy::legacy_fixture_set_tag_policy(
                 RuntimeOrigin::signed(1),
                 b"did:tag".to_vec(),
                 policy(10),
@@ -453,7 +638,7 @@ fn legacy_proof_cannot_create_v1_policy_but_can_clear_preserved_state() {
             signed_policy_payload(did_value, PolicyAction::SetRecipient(policy(25)), 0);
 
         assert_noop!(
-            DeliveryPolicy::apply_policy_with_proof(
+            DeliveryPolicy::legacy_fixture_apply_policy_with_proof(
                 RuntimeOrigin::none(),
                 payload,
                 signature,
@@ -466,7 +651,7 @@ fn legacy_proof_cannot_create_v1_policy_but_can_clear_preserved_state() {
         RecipientPolicies::<Test>::insert(did(did_value), policy(25));
         let (payload, signature, signer_key_id) =
             signed_policy_payload(did_value, PolicyAction::ClearRecipient, 0);
-        assert_ok!(DeliveryPolicy::apply_policy_with_proof(
+        assert_ok!(DeliveryPolicy::legacy_fixture_apply_policy_with_proof(
             RuntimeOrigin::none(),
             payload,
             signature,
@@ -485,7 +670,7 @@ fn did_key_policy_proof_rejects_replay_and_invalid_signature() {
         RecipientPolicies::<Test>::insert(did(did_value), policy(25));
         let (payload, signature, signer_key_id) =
             signed_policy_payload(did_value, PolicyAction::ClearRecipient, 0);
-        assert_ok!(DeliveryPolicy::apply_policy_with_proof(
+        assert_ok!(DeliveryPolicy::legacy_fixture_apply_policy_with_proof(
             RuntimeOrigin::none(),
             payload.clone(),
             signature,
@@ -493,7 +678,7 @@ fn did_key_policy_proof_rejects_replay_and_invalid_signature() {
         ));
 
         assert_noop!(
-            DeliveryPolicy::apply_policy_with_proof(
+            DeliveryPolicy::legacy_fixture_apply_policy_with_proof(
                 RuntimeOrigin::none(),
                 payload,
                 b"invalid".to_vec(),
@@ -506,7 +691,7 @@ fn did_key_policy_proof_rejects_replay_and_invalid_signature() {
         let (payload, _, signer_key_id) =
             signed_policy_payload(did_value, PolicyAction::ClearRecipient, 1);
         assert_noop!(
-            DeliveryPolicy::apply_policy_with_proof(
+            DeliveryPolicy::legacy_fixture_apply_policy_with_proof(
                 RuntimeOrigin::none(),
                 payload,
                 b"invalid".to_vec(),
@@ -538,7 +723,7 @@ fn v2_did_policy_proof_sets_policy_and_rejects_replay() {
         }
         .encode();
 
-        assert_ok!(DeliveryPolicy::apply_policy_v2_with_proof(
+        assert_ok!(DeliveryPolicy::legacy_fixture_apply_policy_v2_with_proof(
             RuntimeOrigin::none(),
             authorization.clone(),
             authorization.clone(),
@@ -548,7 +733,7 @@ fn v2_did_policy_proof_sets_policy_and_rejects_replay() {
         assert_eq!(PolicyV2Nonces::<Test>::get(&operator), 1);
 
         assert_noop!(
-            DeliveryPolicy::apply_policy_v2_with_proof(
+            DeliveryPolicy::legacy_fixture_apply_policy_v2_with_proof(
                 RuntimeOrigin::none(),
                 authorization.clone(),
                 authorization,
@@ -572,7 +757,7 @@ fn v2_policy_lookup_ttl_is_bounded_and_exposed_in_resolution() {
         );
         policy.policy_ttl_seconds = 0;
         assert_noop!(
-            DeliveryPolicy::set_did_policy_v2(
+            DeliveryPolicy::legacy_fixture_set_did_policy_v2(
                 RuntimeOrigin::signed(1),
                 operator.to_vec(),
                 policy.clone()
@@ -581,7 +766,7 @@ fn v2_policy_lookup_ttl_is_bounded_and_exposed_in_resolution() {
         );
         policy.policy_ttl_seconds = 301;
         assert_noop!(
-            DeliveryPolicy::set_did_policy_v2(
+            DeliveryPolicy::legacy_fixture_set_did_policy_v2(
                 RuntimeOrigin::signed(1),
                 operator.to_vec(),
                 policy.clone()
@@ -589,7 +774,7 @@ fn v2_policy_lookup_ttl_is_bounded_and_exposed_in_resolution() {
             Error::<Test>::InvalidPolicyTtl
         );
         policy.policy_ttl_seconds = 45;
-        assert_ok!(DeliveryPolicy::set_did_policy_v2(
+        assert_ok!(DeliveryPolicy::legacy_fixture_set_did_policy_v2(
             RuntimeOrigin::signed(1),
             operator.to_vec(),
             policy
@@ -614,7 +799,7 @@ fn v2_constraints_are_clock_time_and_bounded_by_network_limits() {
         assert_eq!(stored.max_chunk_bytes, 2_097_152);
         assert_eq!(stored.max_replicas, 4);
         let scope = PolicyScopeV2::Did(did(b"did:alice"));
-        assert_ok!(DeliveryPolicy::set_did_policy_v2(
+        assert_ok!(DeliveryPolicy::legacy_fixture_set_did_policy_v2(
             RuntimeOrigin::signed(1),
             b"did:alice".to_vec(),
             policy_v2(
@@ -658,164 +843,24 @@ fn v2_constraints_are_clock_time_and_bounded_by_network_limits() {
     });
 }
 
-#[test]
-fn persona_registration_is_unique_canonical_and_dns_attested() {
-    new_test_ext().execute_with(|| {
-        Timestamp::set_timestamp(10);
-        approve_attestor(99);
-        let canonical = persona(b"example.com");
-        let operator = did(b"did:alice");
-        let proof = [7u8; 32];
-        let attestation = persona_attestation(&canonical, &operator, proof, 0, 10_000);
 
-        assert_ok!(DeliveryPolicy::register_persona(
-            RuntimeOrigin::signed(1),
-            b"Example.COM.".to_vec(),
-            b"did:alice".to_vec(),
-            vec![b"did:alice#policy-1".to_vec()],
-            1,
-            Some(requested_constraints(48_000)),
-            proof,
-            0,
-            10_000,
-            99,
-            attestation,
-        ));
-        let record = Personas::<Test>::get(&canonical).unwrap();
-        assert_eq!(record.operator_did, operator);
-        assert_eq!(
-            record.delivery_constraints.unwrap().effective_ttl_seconds,
-            48_000
-        );
 
-        let next_attestation = persona_attestation(&canonical, &operator, proof, 1, 20_000);
-        assert_noop!(
-            DeliveryPolicy::register_persona(
-                RuntimeOrigin::signed(1),
-                b"example.com".to_vec(),
-                b"did:alice".to_vec(),
-                vec![b"did:alice#policy-1".to_vec()],
-                1,
-                None,
-                proof,
-                1,
-                20_000,
-                99,
-                next_attestation,
-            ),
-            Error::<Test>::PersonaAlreadyExists
-        );
 
-        assert_noop!(
-            DeliveryPolicy::register_persona(
-                RuntimeOrigin::signed(1),
-                b"not-a-domain".to_vec(),
-                b"did:alice".to_vec(),
-                vec![b"did:alice#policy-1".to_vec()],
-                1,
-                None,
-                proof,
-                0,
-                10_000,
-                99,
-                Vec::new(),
-            ),
-            Error::<Test>::InvalidPersona
-        );
-        assert_noop!(
-            DeliveryPolicy::register_persona(
-                RuntimeOrigin::signed(1),
-                b"127.0.0.1".to_vec(),
-                b"did:alice".to_vec(),
-                vec![b"did:alice#policy-1".to_vec()],
-                1,
-                None,
-                proof,
-                0,
-                10_000,
-                99,
-                Vec::new(),
-            ),
-            Error::<Test>::InvalidPersona
-        );
-    });
-}
-
-#[test]
-fn persona_proof_path_requires_operator_and_dns_attestor_signatures() {
-    new_test_ext().execute_with(|| {
-        Timestamp::set_timestamp(10);
-        approve_attestor(99);
-        let persona_id = persona(b"proof.example");
-        let operator = did(b"did:alice");
-        let proof = [11u8; 32];
-        let attestation = persona_attestation(&persona_id, &operator, proof, 0, 10_000);
-        let signer_key_id = b"did:alice#policy-1".to_vec();
-        let payload = PersonaAuthorizationPayload::<Test> {
-            operator_did: operator.clone(),
-            operation: PersonaOperation::Register {
-                persona: persona_id.clone(),
-                controller_key_ids: vec![signer_key_id.clone().try_into().unwrap()]
-                    .try_into()
-                    .unwrap(),
-                controller_threshold: 1,
-                constraints: None,
-                dns_proof_hash: proof,
-                challenge_nonce: 0,
-                verification_expires_at: 10_000,
-                attestor: 99,
-                attestation_signature: attestation,
-            },
-            nonce: 0,
-            valid_until: 1_000,
-            signer_key_id: signer_key_id.clone().try_into().unwrap(),
-        }
-        .encode();
-
-        assert_ok!(DeliveryPolicy::apply_persona_with_proof(
-            RuntimeOrigin::none(),
-            payload.clone(),
-            payload.clone(),
-            signer_key_id.clone(),
-        ));
-        assert!(Personas::<Test>::contains_key(&persona_id));
-        assert_eq!(PersonaOperatorNonces::<Test>::get(&operator), 1);
-
-        assert_noop!(
-            DeliveryPolicy::apply_persona_with_proof(
-                RuntimeOrigin::none(),
-                payload.clone(),
-                payload,
-                signer_key_id,
-            ),
-            Error::<Test>::InvalidPersonaOperatorNonce
-        );
-    });
-}
 
 #[test]
 fn persona_policy_proof_requires_a_registered_controller_key() {
     new_test_ext().execute_with(|| {
         Timestamp::set_timestamp(10);
-        approve_attestor(99);
         let persona_id = persona(b"controller.example");
         let operator = did(b"did:alice");
         let controller = b"did:alice#policy-1".to_vec();
-        let proof = [12u8; 32];
-        let attestation = persona_attestation(&persona_id, &operator, proof, 0, 10_000);
-        assert_ok!(DeliveryPolicy::register_persona(
-            RuntimeOrigin::signed(1),
+        assert_ok!(seed_persona_fixture(RuntimeOrigin::signed(1),
             persona_id.to_vec(),
             operator.to_vec(),
             vec![controller.clone()],
             1,
             None,
-            proof,
-            0,
-            10_000,
-            99,
-            attestation,
-        ));
+            10_000));
 
         let scope = PolicyScopeV2::Persona(persona_id.clone());
         let persona_policy = policy_v2(
@@ -834,7 +879,7 @@ fn persona_policy_proof_requires_a_registered_controller_key() {
         }
         .encode();
         assert_noop!(
-            DeliveryPolicy::apply_policy_v2_with_proof(
+            DeliveryPolicy::legacy_fixture_apply_policy_v2_with_proof(
                 RuntimeOrigin::none(),
                 unauthorized_payload.clone(),
                 unauthorized_payload,
@@ -851,7 +896,7 @@ fn persona_policy_proof_requires_a_registered_controller_key() {
             signer_key_id: controller.clone().try_into().unwrap(),
         }
         .encode();
-        assert_ok!(DeliveryPolicy::apply_policy_v2_with_proof(
+        assert_ok!(DeliveryPolicy::legacy_fixture_apply_policy_v2_with_proof(
             RuntimeOrigin::none(),
             authorized_payload.clone(),
             authorized_payload,
@@ -866,26 +911,17 @@ fn persona_policy_proof_requires_a_registered_controller_key() {
 fn persona_controller_rotation_must_retain_the_authorizing_did_key() {
     new_test_ext().execute_with(|| {
         Timestamp::set_timestamp(10);
-        approve_attestor(99);
         let persona_id = persona(b"rotation.example");
         let operator = did(b"did:alice");
         let current_signer = b"did:alice#policy-1".to_vec();
         let next_signer = b"did:alice#policy-2".to_vec();
-        let proof = [13u8; 32];
-        let attestation = persona_attestation(&persona_id, &operator, proof, 0, 10_000);
-        assert_ok!(DeliveryPolicy::register_persona(
-            RuntimeOrigin::signed(1),
+        assert_ok!(seed_persona_fixture(RuntimeOrigin::signed(1),
             persona_id.to_vec(),
             operator.to_vec(),
             vec![current_signer.clone()],
             1,
             None,
-            proof,
-            0,
-            10_000,
-            99,
-            attestation,
-        ));
+            10_000));
 
         let unsafe_rotation = PersonaAuthorizationPayload::<Test> {
             operator_did: operator.clone(),
@@ -947,25 +983,16 @@ fn persona_controller_rotation_must_retain_the_authorizing_did_key() {
 fn revoked_persona_rejects_controller_rotation_without_consuming_nonce() {
     new_test_ext().execute_with(|| {
         Timestamp::set_timestamp(10);
-        approve_attestor(99);
         let persona_id = persona(b"revoked-rotation.example");
         let operator = did(b"did:alice");
         let signer = b"did:alice#policy-1".to_vec();
-        let proof = [14u8; 32];
-        let attestation = persona_attestation(&persona_id, &operator, proof, 0, 10_000);
-        assert_ok!(DeliveryPolicy::register_persona(
-            RuntimeOrigin::signed(1),
+        assert_ok!(seed_persona_fixture(RuntimeOrigin::signed(1),
             persona_id.to_vec(),
             operator.to_vec(),
             vec![signer.clone()],
             1,
             None,
-            proof,
-            0,
-            10_000,
-            99,
-            attestation,
-        ));
+            10_000));
         assert_ok!(DeliveryPolicy::revoke_persona(
             RuntimeOrigin::signed(1),
             persona_id.to_vec(),
@@ -1001,25 +1028,16 @@ fn revoked_persona_rejects_controller_rotation_without_consuming_nonce() {
 fn revoked_persona_rejects_constraint_update_without_consuming_nonce() {
     new_test_ext().execute_with(|| {
         Timestamp::set_timestamp(10);
-        approve_attestor(99);
         let persona_id = persona(b"revoked-constraints.example");
         let operator = did(b"did:alice");
         let signer = b"did:alice#policy-1".to_vec();
-        let proof = [15u8; 32];
-        let attestation = persona_attestation(&persona_id, &operator, proof, 0, 10_000);
-        assert_ok!(DeliveryPolicy::register_persona(
-            RuntimeOrigin::signed(1),
+        assert_ok!(seed_persona_fixture(RuntimeOrigin::signed(1),
             persona_id.to_vec(),
             operator.to_vec(),
             vec![signer.clone()],
             1,
             None,
-            proof,
-            0,
-            10_000,
-            99,
-            attestation,
-        ));
+            10_000));
         assert_ok!(DeliveryPolicy::revoke_persona(
             RuntimeOrigin::signed(1),
             persona_id.to_vec(),
@@ -1037,7 +1055,7 @@ fn revoked_persona_rejects_constraint_update_without_consuming_nonce() {
         }
         .encode();
         assert_noop!(
-            DeliveryPolicy::apply_policy_v2_with_proof(
+            DeliveryPolicy::legacy_fixture_apply_policy_v2_with_proof(
                 RuntimeOrigin::none(),
                 update.clone(),
                 update,
@@ -1052,203 +1070,27 @@ fn revoked_persona_rejects_constraint_update_without_consuming_nonce() {
     });
 }
 
-#[test]
-fn revoked_persona_can_renew_and_reactivate() {
-    new_test_ext().execute_with(|| {
-        Timestamp::set_timestamp(10);
-        approve_attestor(99);
-        let persona_id = persona(b"revoked-renewal.example");
-        let operator = did(b"did:alice");
-        let signer = b"did:alice#policy-1".to_vec();
-        let registration_proof = [16u8; 32];
-        let registration_attestation =
-            persona_attestation(&persona_id, &operator, registration_proof, 0, 10_000);
-        assert_ok!(DeliveryPolicy::register_persona(
-            RuntimeOrigin::signed(1),
-            persona_id.to_vec(),
-            operator.to_vec(),
-            vec![signer.clone()],
-            1,
-            None,
-            registration_proof,
-            0,
-            10_000,
-            99,
-            registration_attestation,
-        ));
-        assert_ok!(DeliveryPolicy::revoke_persona(
-            RuntimeOrigin::signed(1),
-            persona_id.to_vec(),
-        ));
 
-        let renewal_proof = [17u8; 32];
-        let renewal_attestation =
-            persona_attestation(&persona_id, &operator, renewal_proof, 1, 20_000);
-        let renewal = PersonaAuthorizationPayload::<Test> {
-            operator_did: operator.clone(),
-            operation: PersonaOperation::Renew {
-                persona: persona_id.clone(),
-                constraints: Some(requested_constraints(7_200)),
-                dns_proof_hash: renewal_proof,
-                challenge_nonce: 1,
-                verification_expires_at: 20_000,
-                attestor: 99,
-                attestation_signature: renewal_attestation,
-            },
-            nonce: 0,
-            valid_until: 1_000,
-            signer_key_id: signer.clone().try_into().unwrap(),
-        }
-        .encode();
-        assert_ok!(DeliveryPolicy::apply_persona_with_proof(
-            RuntimeOrigin::none(),
-            renewal.clone(),
-            renewal,
-            signer,
-        ));
 
-        let renewed = Personas::<Test>::get(&persona_id).unwrap();
-        assert!(renewed.active);
-        assert_eq!(renewed.verification_expires_at, 20_000);
-        assert_eq!(
-            renewed.delivery_constraints.unwrap().effective_ttl_seconds,
-            7_200
-        );
-        assert_eq!(PersonaOperatorNonces::<Test>::get(&operator), 1);
-    });
-}
 
-#[test]
-fn persona_transfer_requires_both_operators_and_fresh_dns_attestation() {
-    new_test_ext().execute_with(|| {
-        Timestamp::set_timestamp(10);
-        approve_attestor(99);
-
-        let persona_id = persona(b"transfer.example");
-        let current_operator = did(b"did:alice");
-        let current_signer = b"did:alice#policy-1".to_vec();
-        let registration_proof = [21u8; 32];
-        let registration_attestation = persona_attestation(
-            &persona_id,
-            &current_operator,
-            registration_proof,
-            0,
-            10_000,
-        );
-        assert_ok!(DeliveryPolicy::register_persona(
-            RuntimeOrigin::signed(1),
-            persona_id.to_vec(),
-            current_operator.to_vec(),
-            vec![current_signer.clone()],
-            1,
-            None,
-            registration_proof,
-            0,
-            10_000,
-            99,
-            registration_attestation,
-        ));
-
-        let persona_scope = PolicyScopeV2::Persona(persona_id.clone());
-        assert_ok!(DeliveryPolicy::set_persona_policy_v2(
-            RuntimeOrigin::signed(1),
-            persona_id.to_vec(),
-            policy_v2(
-                persona_scope,
-                current_operator.as_slice(),
-                1,
-                vec![base_rule(b"old-owner-policy", 1, Vec::new())],
-            ),
-        ));
-
-        let new_operator = did(b"did:bob");
-        let new_signer = b"did:bob#policy-1".to_vec();
-        let new_controllers: crate::ControllerKeysOf<Test> =
-            vec![new_signer.clone().try_into().unwrap()]
-                .try_into()
-                .unwrap();
-        let transfer_proof = [22u8; 32];
-        let transfer_attestation =
-            persona_attestation(&persona_id, &new_operator, transfer_proof, 1, 20_000);
-        let acceptance = PersonaTransferAcceptancePayload::<Test> {
-            domain: BoundedVec::truncate_from(b"openpayload:persona:transfer:v1".to_vec()),
-            genesis_hash: System::block_hash(0u64),
-            persona: persona_id.clone(),
-            current_operator_did: current_operator.clone(),
-            new_operator_did: new_operator.clone(),
-            new_controller_key_ids: new_controllers.clone(),
-            new_controller_threshold: 1,
-            constraints: None,
-            dns_proof_hash: transfer_proof,
-            challenge_nonce: 1,
-            verification_expires_at: 20_000,
-            new_operator_signer_key_id: new_signer.clone().try_into().unwrap(),
-        }
-        .encode();
-        let authorization = PersonaAuthorizationPayload::<Test> {
-            operator_did: current_operator.clone(),
-            operation: PersonaOperation::Transfer {
-                persona: persona_id.clone(),
-                new_operator_did: new_operator.clone(),
-                new_controller_key_ids: new_controllers,
-                new_controller_threshold: 1,
-                constraints: None,
-                dns_proof_hash: transfer_proof,
-                challenge_nonce: 1,
-                verification_expires_at: 20_000,
-                attestor: 99,
-                attestation_signature: transfer_attestation,
-                new_operator_signer_key_id: new_signer.try_into().unwrap(),
-                new_operator_signature: acceptance,
-            },
-            nonce: 0,
-            valid_until: 1_000,
-            signer_key_id: current_signer.clone().try_into().unwrap(),
-        }
-        .encode();
-
-        assert_ok!(DeliveryPolicy::apply_persona_with_proof(
-            RuntimeOrigin::none(),
-            authorization.clone(),
-            authorization,
-            current_signer,
-        ));
-
-        let transferred = Personas::<Test>::get(&persona_id).expect("persona remains active");
-        assert_eq!(transferred.operator_did, new_operator);
-        assert_eq!(transferred.revision, 2);
-        assert!(transferred.active);
-        assert!(PersonaPoliciesV2::<Test>::get(&persona_id).is_none());
-        assert_eq!(PersonaOperatorNonces::<Test>::get(&current_operator), 1);
-    });
-}
 
 #[test]
 fn v2_resolution_uses_persona_then_did_and_tag_is_only_a_condition() {
     new_test_ext().execute_with(|| {
         Timestamp::set_timestamp(10);
-        approve_attestor(99);
         let persona_id = persona(b"example.com");
         let operator = did(b"did:alice");
-        let proof = [9u8; 32];
-        let attestation = persona_attestation(&persona_id, &operator, proof, 0, 10_000);
-        assert_ok!(DeliveryPolicy::register_persona(
-            RuntimeOrigin::signed(1),
+        assert_ok!(seed_persona_fixture(RuntimeOrigin::signed(1),
             persona_id.to_vec(),
             operator.to_vec(),
             vec![b"did:alice#policy-1".to_vec()],
             1,
             None,
-            proof,
-            0,
-            10_000,
-            99,
-            attestation,
-        ));
+            10_000));
 
         let recipient = did(b"did:recipient");
         let did_scope = PolicyScopeV2::Did(recipient.clone());
-        assert_ok!(DeliveryPolicy::set_did_policy_v2(
+        assert_ok!(DeliveryPolicy::legacy_fixture_set_did_policy_v2(
             RuntimeOrigin::signed(1),
             recipient.to_vec(),
             policy_v2(
@@ -1261,7 +1103,7 @@ fn v2_resolution_uses_persona_then_did_and_tag_is_only_a_condition() {
 
         let legal_tag: TagOf<Test> = b"Legal".to_vec().try_into().unwrap();
         let persona_scope = PolicyScopeV2::Persona(persona_id.clone());
-        assert_ok!(DeliveryPolicy::set_persona_policy_v2(
+        assert_ok!(DeliveryPolicy::legacy_fixture_set_persona_policy_v2(
             RuntimeOrigin::signed(1),
             persona_id.to_vec(),
             policy_v2(
@@ -1307,7 +1149,6 @@ fn v2_resolution_uses_persona_then_did_and_tag_is_only_a_condition() {
 fn merged_did_and_persona_constraints_ignore_legacy_aggregate_fields() {
     new_test_ext().execute_with(|| {
         Timestamp::set_timestamp(10);
-        approve_attestor(99);
 
         let recipient = did(b"did:recipient");
         let mut did_constraints = requested_constraints(86_400);
@@ -1321,26 +1162,18 @@ fn merged_did_and_persona_constraints_ignore_legacy_aggregate_fields() {
 
         let persona_id = persona(b"merge.example");
         let operator = did(b"did:alice");
-        let proof = [31u8; 32];
-        let attestation = persona_attestation(&persona_id, &operator, proof, 0, 10_000);
         let mut persona_constraints = requested_constraints(86_400);
         persona_constraints.max_chunk_bytes = 1024 * 1024;
         persona_constraints.max_message_bytes = 32 * 1024 * 1024;
-        assert_ok!(DeliveryPolicy::register_persona(
-            RuntimeOrigin::signed(1),
+        assert_ok!(seed_persona_fixture(RuntimeOrigin::signed(1),
             persona_id.to_vec(),
             operator.to_vec(),
             vec![b"did:alice#policy-1".to_vec()],
             1,
             Some(persona_constraints),
-            proof,
-            0,
-            10_000,
-            99,
-            attestation,
-        ));
+            10_000));
         let scope = PolicyScopeV2::Persona(persona_id.clone());
-        assert_ok!(DeliveryPolicy::set_persona_policy_v2(
+        assert_ok!(DeliveryPolicy::legacy_fixture_set_persona_policy_v2(
             RuntimeOrigin::signed(1),
             persona_id.to_vec(),
             policy_v2(
@@ -1369,11 +1202,10 @@ fn merged_did_and_persona_constraints_ignore_legacy_aggregate_fields() {
 fn did_fallback_keeps_addressed_persona_constraints() {
     new_test_ext().execute_with(|| {
         Timestamp::set_timestamp(10);
-        approve_attestor(99);
 
         let recipient = did(b"did:recipient");
         let did_scope = PolicyScopeV2::Did(recipient.clone());
-        assert_ok!(DeliveryPolicy::set_did_policy_v2(
+        assert_ok!(DeliveryPolicy::legacy_fixture_set_did_policy_v2(
             RuntimeOrigin::signed(1),
             recipient.to_vec(),
             policy_v2(
@@ -1386,27 +1218,19 @@ fn did_fallback_keeps_addressed_persona_constraints() {
 
         let persona_id = persona(b"bounded.example");
         let operator = did(b"did:alice");
-        let proof = [41u8; 32];
-        let attestation = persona_attestation(&persona_id, &operator, proof, 0, 10_000);
         let mut persona_constraints = requested_constraints(3_600);
         persona_constraints.max_replicas = 2;
-        assert_ok!(DeliveryPolicy::register_persona(
-            RuntimeOrigin::signed(1),
+        assert_ok!(seed_persona_fixture(RuntimeOrigin::signed(1),
             persona_id.to_vec(),
             operator.to_vec(),
             vec![b"did:alice#policy-1".to_vec()],
             1,
             Some(persona_constraints),
-            proof,
-            0,
-            10_000,
-            99,
-            attestation,
-        ));
+            10_000));
 
         let legal_tag: TagOf<Test> = b"Legal".to_vec().try_into().unwrap();
         let persona_scope = PolicyScopeV2::Persona(persona_id.clone());
-        assert_ok!(DeliveryPolicy::set_persona_policy_v2(
+        assert_ok!(DeliveryPolicy::legacy_fixture_set_persona_policy_v2(
             RuntimeOrigin::signed(1),
             persona_id.to_vec(),
             policy_v2(
@@ -1437,7 +1261,6 @@ fn did_fallback_keeps_addressed_persona_constraints() {
 fn persona_override_is_clamped_by_recipient_without_losing_persona_precedence() {
     new_test_ext().execute_with(|| {
         Timestamp::set_timestamp(10);
-        approve_attestor(99);
 
         let recipient = did(b"did:recipient");
         let mut did_constraints = requested_constraints(3_600);
@@ -1453,7 +1276,7 @@ fn persona_override_is_clamped_by_recipient_without_losing_persona_precedence() 
             did_constraints,
         ));
         let did_scope = PolicyScopeV2::Did(recipient.clone());
-        assert_ok!(DeliveryPolicy::set_did_policy_v2(
+        assert_ok!(DeliveryPolicy::legacy_fixture_set_did_policy_v2(
             RuntimeOrigin::signed(1),
             recipient.to_vec(),
             policy_v2(
@@ -1466,23 +1289,15 @@ fn persona_override_is_clamped_by_recipient_without_losing_persona_precedence() 
 
         let persona_id = persona(b"override-clamp.example");
         let operator = did(b"did:alice");
-        let proof = [42u8; 32];
-        let attestation = persona_attestation(&persona_id, &operator, proof, 0, 10_000);
         let mut persona_constraints = requested_constraints(86_400);
         persona_constraints.max_replicas = 4;
-        assert_ok!(DeliveryPolicy::register_persona(
-            RuntimeOrigin::signed(1),
+        assert_ok!(seed_persona_fixture(RuntimeOrigin::signed(1),
             persona_id.to_vec(),
             operator.to_vec(),
             vec![b"did:alice#policy-1".to_vec()],
             1,
             Some(persona_constraints),
-            proof,
-            0,
-            10_000,
-            99,
-            attestation,
-        ));
+            10_000));
 
         let mut persona_rule = base_rule(b"persona-winner", 100, Vec::new());
         persona_rule.constraint_overrides = Some(DeliveryConstraintOverrides {
@@ -1495,7 +1310,7 @@ fn persona_override_is_clamped_by_recipient_without_losing_persona_precedence() 
             max_replicas: Some(3),
         });
         let persona_scope = PolicyScopeV2::Persona(persona_id.clone());
-        assert_ok!(DeliveryPolicy::set_persona_policy_v2(
+        assert_ok!(DeliveryPolicy::legacy_fixture_set_persona_policy_v2(
             RuntimeOrigin::signed(1),
             persona_id.to_vec(),
             policy_v2(persona_scope, operator.as_slice(), 1, vec![persona_rule],),
@@ -1548,7 +1363,7 @@ fn legacy_aggregate_fields_are_accepted_but_never_enforced_or_resolved() {
             max_chunks: Some(1),
             max_replicas: None,
         });
-        assert_ok!(DeliveryPolicy::set_did_policy_v2(
+        assert_ok!(DeliveryPolicy::legacy_fixture_set_did_policy_v2(
             RuntimeOrigin::signed(1),
             b"did:alice".to_vec(),
             policy_v2(scope, b"did:alice", 1, vec![rule]),
@@ -1563,7 +1378,7 @@ fn legacy_aggregate_fields_are_accepted_but_never_enforced_or_resolved() {
 fn rule_priority_is_bounded_for_directory_interop() {
     new_test_ext().execute_with(|| {
         let scope = PolicyScopeV2::Did(did(b"did:alice"));
-        assert_ok!(DeliveryPolicy::set_did_policy_v2(
+        assert_ok!(DeliveryPolicy::legacy_fixture_set_did_policy_v2(
             RuntimeOrigin::signed(1),
             b"did:alice".to_vec(),
             policy_v2(
@@ -1574,7 +1389,7 @@ fn rule_priority_is_bounded_for_directory_interop() {
             ),
         ));
         assert_noop!(
-            DeliveryPolicy::set_did_policy_v2(
+            DeliveryPolicy::legacy_fixture_set_did_policy_v2(
                 RuntimeOrigin::signed(1),
                 b"did:alice".to_vec(),
                 policy_v2(
@@ -1612,7 +1427,7 @@ fn rule_overrides_can_only_narrow_scope_constraints() {
             max_chunks: None,
             max_replicas: Some(2),
         });
-        assert_ok!(DeliveryPolicy::set_did_policy_v2(
+        assert_ok!(DeliveryPolicy::legacy_fixture_set_did_policy_v2(
             RuntimeOrigin::signed(1),
             b"did:alice".to_vec(),
             policy_v2(scope, b"did:alice", 1, vec![rule]),
@@ -1633,7 +1448,7 @@ fn rule_overrides_can_only_narrow_scope_constraints() {
             max_replicas: None,
         });
         assert_noop!(
-            DeliveryPolicy::set_did_policy_v2(
+            DeliveryPolicy::legacy_fixture_set_did_policy_v2(
                 RuntimeOrigin::signed(2),
                 b"did:bob".to_vec(),
                 policy_v2(scope, b"did:bob", 1, vec![invalid]),
@@ -1703,7 +1518,7 @@ fn delivery_plan_rejects_cycles_and_invalid_replication() {
         };
         let scope = PolicyScopeV2::Did(did(b"did:alice"));
         assert_noop!(
-            DeliveryPolicy::set_did_policy_v2(
+            DeliveryPolicy::legacy_fixture_set_did_policy_v2(
                 RuntimeOrigin::signed(1),
                 b"did:alice".to_vec(),
                 policy_v2(scope, b"did:alice", 1, vec![rule]),
@@ -1745,7 +1560,7 @@ fn delivery_plan_accepts_zero_forward_steps() {
         };
         let scope = PolicyScopeV2::Did(did(b"did:alice"));
 
-        assert_ok!(DeliveryPolicy::set_did_policy_v2(
+        assert_ok!(DeliveryPolicy::legacy_fixture_set_did_policy_v2(
             RuntimeOrigin::signed(1),
             b"did:alice".to_vec(),
             policy_v2(scope, b"did:alice", 1, vec![rule]),
@@ -1782,7 +1597,7 @@ fn delivery_plan_accepts_one_forward_step() {
         };
         let scope = PolicyScopeV2::Did(did(b"did:alice"));
 
-        assert_ok!(DeliveryPolicy::set_did_policy_v2(
+        assert_ok!(DeliveryPolicy::legacy_fixture_set_did_policy_v2(
             RuntimeOrigin::signed(1),
             b"did:alice".to_vec(),
             policy_v2(scope, b"did:alice", 1, vec![rule]),
@@ -1820,7 +1635,7 @@ fn delivery_target_service_check_also_requires_an_existing_active_did() {
         let scope = PolicyScopeV2::Did(did(b"did:alice"));
 
         assert_noop!(
-            DeliveryPolicy::set_did_policy_v2(
+            DeliveryPolicy::legacy_fixture_set_did_policy_v2(
                 RuntimeOrigin::signed(1),
                 b"did:alice".to_vec(),
                 policy_v2(scope, b"did:alice", 1, vec![rule]),
@@ -1871,7 +1686,7 @@ fn aggregate_policy_complexity_bounds_nested_rules_steps_and_targets() {
         let scope = PolicyScopeV2::Did(did(b"did:alice"));
 
         assert_noop!(
-            DeliveryPolicy::set_did_policy_v2(
+            DeliveryPolicy::legacy_fixture_set_did_policy_v2(
                 RuntimeOrigin::signed(1),
                 b"did:alice".to_vec(),
                 policy_v2(scope, b"did:alice", 1, rules),
@@ -1928,7 +1743,7 @@ fn delivery_plan_rejects_two_forward_steps() {
         let scope = PolicyScopeV2::Did(did(b"did:alice"));
 
         assert_noop!(
-            DeliveryPolicy::set_did_policy_v2(
+            DeliveryPolicy::legacy_fixture_set_did_policy_v2(
                 RuntimeOrigin::signed(1),
                 b"did:alice".to_vec(),
                 policy_v2(scope, b"did:alice", 1, vec![rule]),
@@ -1992,7 +1807,7 @@ fn delivery_plan_rejects_overlapping_next_transitions() {
         let scope = PolicyScopeV2::Did(did(b"did:alice"));
 
         assert_noop!(
-            DeliveryPolicy::set_did_policy_v2(
+            DeliveryPolicy::legacy_fixture_set_did_policy_v2(
                 RuntimeOrigin::signed(1),
                 b"did:alice".to_vec(),
                 policy_v2(scope, b"did:alice", 1, vec![rule]),
@@ -2056,7 +1871,7 @@ fn runtime_view_preserves_store_archive_and_full_u16_weights() {
             constraint_overrides: None,
         };
         let scope = PolicyScopeV2::Did(did(b"did:alice"));
-        assert_ok!(DeliveryPolicy::set_did_policy_v2(
+        assert_ok!(DeliveryPolicy::legacy_fixture_set_did_policy_v2(
             RuntimeOrigin::signed(1),
             b"did:alice".to_vec(),
             policy_v2(scope, b"did:alice", 1, vec![rule]),
@@ -2093,7 +1908,7 @@ fn semantic_v3_migration_preserves_legacy_storage() {
         DeliveryPolicy::on_runtime_upgrade();
         assert_eq!(
             DeliveryPolicy::on_chain_storage_version(),
-            StorageVersion::new(5)
+            StorageVersion::new(8)
         );
         assert_eq!(
             RecipientPolicies::<Test>::get(did(b"did:alice"))
@@ -2212,7 +2027,7 @@ fn semantic_v3_resolution_normalizes_preupgrade_aggregate_fields() {
         assert_eq!(resolved.effective_constraints.max_chunks, u16::MAX);
         assert_eq!(
             DeliveryPolicy::on_chain_storage_version(),
-            StorageVersion::new(5)
+            StorageVersion::new(8)
         );
     });
 }
@@ -2233,7 +2048,7 @@ fn semantic_v3_try_runtime_guard_checks_version_and_all_pallet_storage() {
         PolicyV2Nonces::<Test>::insert(did(b"did:alice"), 1);
         assert!(DeliveryPolicy::post_upgrade(state).is_err());
 
-        StorageVersion::new(5).put::<DeliveryPolicy>();
+        StorageVersion::new(9).put::<DeliveryPolicy>();
         assert!(DeliveryPolicy::pre_upgrade().is_err());
     });
 }
@@ -2261,4 +2076,158 @@ fn legacy_and_v2_call_indices_are_stable() {
     assert_eq!(constraints.encode()[0], 5);
     assert_eq!(persona_proof.encode()[0], 15);
     assert_eq!(attestor.encode()[0], 16);
+}
+
+fn recovery_registration() -> PersonaOf<Test> {
+    let name = persona(b"recovery.example");
+    Personas::<Test>::insert(&name, crate::PersonaRecord::<Test> {
+        operator_did: did(b"did:alice"),
+        controller_key_ids: vec![b"did:alice#root".to_vec().try_into().unwrap()].try_into().unwrap(),
+        controller_threshold: 1, delivery_constraints: None, dns_proof_hash: [1; 32],
+        verified_at: 1, verification_expires_at: 2, revision: 1, active: false,
+    }); // Recovery is also available after expiry/revocation.
+    name
+}
+
+
+
+fn recovery_call(operator: &[u8], operation: PersonaOperation<Test>) -> frame_support::dispatch::DispatchResult {
+    let owner = did(operator);
+    let mut key = operator.to_vec(); key.extend_from_slice(b"#root");
+    let payload = PersonaAuthorizationPayload::<Test> { operator_did: owner.clone(), operation,
+        nonce: PersonaOperatorNonces::<Test>::get(&owner), valid_until: Timestamp::get() + 300000,
+        signer_key_id: key.clone().try_into().unwrap() }.encode();
+    DeliveryPolicy::apply_persona_with_proof(RuntimeOrigin::none(), payload.clone(), payload, key)
+}
+
+
+
+
+
+
+
+
+
+
+#[test]
+fn dnssec_challenge_matches_directory_golden_vector() {
+    assert_eq!(core::str::from_utf8(&crate::dnssec::challenge_value(&[0x11; 32], b"example.com",
+        b"did:openpayload:2222222222222222222222", b"register_persona", 4, 1_790_000_100_000, &[0; 32])).unwrap(),
+        "openpayload-persona-dnssec-v1=7ae31c3cb38bb82e66d205c4a8a0343d22b5dfc3466031b67b20136cc50465a7");
+}
+
+#[test]
+fn dnssec_rejects_signatures_outside_label_boundaries_and_untrusted_root_keys() {
+    new_test_ext().execute_with(|| {
+        Timestamp::set_timestamp(1_700_000_100_000); install_test_dnssec_root();
+        let name = "_openpayload-persona.notexample.com.";
+        // Fixture signer is example.com: a string suffix must not establish zone authority.
+        let proof = signed_dnssec_txt_in_zone(name, b"test", 1_600_000_000, 2_000_000_000, "example.com.");
+        assert_eq!(DeliveryPolicy::verify_dnssec_txt(name.as_bytes().to_vec(), b"test".to_vec(), proof), None);
+        let (_, rogue) = dnssec_key(".", 44); let ds = dnssec_ds(&rogue);
+        let _ = crate::DnssecRootTrustAnchors::<Test>::clear(8, None);
+        assert_ok!(DeliveryPolicy::set_dnssec_root_trust_anchor(RuntimeOrigin::root(), ds.key_tag,
+            crate::DnssecRootTrustAnchor { algorithm: 13, digest: ds.digest.try_into().unwrap(), valid_from: 0, valid_until: 0 }));
+        let name = "_openpayload-persona.example.com.";
+        assert_eq!(DeliveryPolicy::verify_dnssec_txt(name.as_bytes().to_vec(), b"test".to_vec(),
+            signed_dnssec_txt(name, b"test", 1_600_000_000, 2_000_000_000)), None);
+    });
+}
+
+#[test]
+fn dnssec_unsigned_pool_admission_requires_valid_evidence_and_operator_signature() {
+    new_test_ext().execute_with(|| {
+        Timestamp::set_timestamp(1_700_000_010_000); install_test_dnssec_root();
+        let name = persona(b"example.com"); let owner = did(b"did:alice"); let expiry = 1_700_001_000_000;
+        let (hash, proof) = dnssec_evidence(&name, &owner, b"register_persona", 0, expiry, &[0; 32]);
+        let operation = PersonaOperation::Register { persona: name.clone(), controller_key_ids:
+            vec![b"did:alice#root".to_vec().try_into().unwrap()].try_into().unwrap(), controller_threshold: 1,
+            constraints: None, dns_proof_hash: hash, challenge_nonce: 0, verification_expires_at: expiry,
+            challenge_expires_at: expiry, dnssec_proof: proof };
+        let payload = PersonaAuthorizationPayload::<Test> { operator_did: owner, operation: operation.clone(),
+            nonce: 0, valid_until: expiry, signer_key_id: b"did:alice#root".to_vec().try_into().unwrap() };
+        let bytes = payload.encode();
+        let call = crate::Call::<Test>::apply_persona_with_proof { signed_payload: bytes.clone(), signature: bytes.clone(), signer_key_id: b"did:alice#root".to_vec() };
+        assert!(DeliveryPolicy::legacy_fixture_validate_unsigned_call(&call).is_ok());
+        let bad_signature = crate::Call::<Test>::apply_persona_with_proof { signed_payload: bytes.clone(), signature: vec![], signer_key_id: b"did:alice#root".to_vec() };
+        assert!(DeliveryPolicy::legacy_fixture_validate_unsigned_call(&bad_signature).is_err());
+        let mut wrong = payload;
+        if let PersonaOperation::Register { dnssec_proof, .. } = &mut wrong.operation { *dnssec_proof = vec![1, 2, 3].try_into().unwrap(); }
+        let bad = wrong.encode();
+        assert!(DeliveryPolicy::legacy_fixture_validate_unsigned_call(&crate::Call::<Test>::apply_persona_with_proof {
+            signed_payload: bad.clone(), signature: bad, signer_key_id: b"did:alice#root".to_vec() }).is_err());
+        // A proof built for a different genesis must not be reusable even when the DID signs it.
+        frame_system::BlockHash::<Test>::insert(0, <Test as frame_system::Config>::Hashing::hash(&[0x11; 32]));
+        assert_noop!(recovery_call(b"did:alice", operation), Error::<Test>::InvalidDnssecProof);
+        assert!(!Personas::<Test>::contains_key(name));
+    });
+}
+
+#[test]
+fn dnssec_transfer_requires_fresh_proof_and_both_operator_signatures() {
+    new_test_ext().execute_with(|| {
+        Timestamp::set_timestamp(1_700_000_010_000); install_test_dnssec_root();
+        let name = persona(b"example.com"); let expiry = 1_700_001_000_000;
+        seed_persona_fixture(RuntimeOrigin::signed(1), name.to_vec(), b"did:alice".to_vec(),
+            vec![b"did:alice#root".to_vec()], 1, None, expiry).unwrap();
+        let keys: crate::ControllerKeysOf<Test> = vec![b"did:bob#root".to_vec().try_into().unwrap()].try_into().unwrap();
+        let (hash, proof) = dnssec_evidence(&name, &did(b"did:bob"), b"transfer_persona", 0, expiry, &[0; 32]);
+        let acceptance = PersonaTransferAcceptancePayload::<Test> { domain: b"openpayload:persona:transfer:v1".to_vec().try_into().unwrap(),
+            genesis_hash: System::block_hash(0u64), persona: name.clone(), current_operator_did: did(b"did:alice"),
+            new_operator_did: did(b"did:bob"), new_controller_key_ids: keys.clone(), new_controller_threshold: 1,
+            constraints: None, dns_proof_hash: hash, challenge_nonce: 0, verification_expires_at: expiry,
+            new_operator_signer_key_id: b"did:bob#root".to_vec().try_into().unwrap() }.encode();
+        let transfer = |signature: Vec<u8>| PersonaOperation::Transfer { persona: name.clone(), new_operator_did: did(b"did:bob"),
+            new_controller_key_ids: keys.clone(), new_controller_threshold: 1, constraints: None,
+            dns_proof_hash: hash, challenge_nonce: 0, verification_expires_at: expiry, challenge_expires_at: expiry,
+            dnssec_proof: proof.clone(), new_operator_signer_key_id: b"did:bob#root".to_vec().try_into().unwrap(),
+            new_operator_signature: signature };
+        let scope=crate::PolicyScopeV3::Persona(name.clone());
+        crate::PoliciesV4::<Test>::insert(&scope,crate::PolicyDocumentRecord::<Test> {
+            revision:3,operator_did:did(b"did:alice"),content_hash:sp_io::hashing::blake2_256(b"old"),document:b"old".to_vec().try_into().unwrap(),
+        });
+        assert_noop!(recovery_call(b"did:alice", transfer(vec![0])), Error::<Test>::InvalidSignature);
+        assert_ok!(recovery_call(b"did:alice", transfer(acceptance)));
+        assert_eq!(Personas::<Test>::get(name).unwrap().operator_did, did(b"did:bob"));
+        let raw=crate::PoliciesV4::<Test>::get(scope).unwrap();
+        assert!(raw.document.is_empty());assert_eq!(raw.revision,4);
+        assert_eq!(raw.content_hash,sp_io::hashing::blake2_256(&[]));
+    });
+}
+
+#[test]
+fn dnssec_txt_observation_cannot_outlive_48_hours_even_with_long_signatures() {
+    new_test_ext().execute_with(|| {
+        install_test_dnssec_root();
+        let name = "_openpayload-persona.example.com.";
+        let value = b"long-lived signature";
+        let proof = signed_dnssec_txt(name, value, 1_700_000_000, 2_000_000_000);
+        Timestamp::set_timestamp(1_700_000_000_000 + 48 * 3_600_000 - 1);
+        assert_eq!(DeliveryPolicy::verify_dnssec_txt(name.as_bytes().to_vec(), value.to_vec(), proof.clone()),
+            Some(1_700_000_000_000 + 48 * 3_600_000));
+        Timestamp::set_timestamp(1_700_000_000_000 + 48 * 3_600_000);
+        assert_eq!(DeliveryPolicy::verify_dnssec_txt(name.as_bytes().to_vec(), value.to_vec(), proof), None);
+    });
+}
+
+#[test]
+fn dnssec_v6_upgrade_preserves_edited_v3_policies_in_existing_v5_storage() {
+    new_test_ext().execute_with(|| {
+        StorageVersion::new(5).put::<DeliveryPolicy>();
+        let name = persona(b"example.com"); let scope = crate::PolicyScopeV3::Persona(name.clone());
+        let legacy = policy_v2(PolicyScopeV2::Persona(name.clone()), b"did:alice", 4,
+            vec![base_rule(b"old-v2-rule", 1, Vec::new())]);
+        PersonaPoliciesV2::<Test>::insert(&name, legacy.clone());
+        let mut id_material = b"openpayload:delivery-policy:v3:".to_vec(); id_material.extend_from_slice(&scope.encode());
+        let edited = crate::DeliveryPolicyV3::<Test> {
+            policy_id: <Test as frame_system::Config>::Hashing::hash(&id_material).as_ref().to_vec().try_into().unwrap(),
+            scope: scope.clone(), operator_did: did(b"did:alice"), revision: 9,
+            ruleset: vec![base_rule(b"edited-v3-rule", 7, Vec::new())].try_into().unwrap(), policy_ttl_seconds: 90,
+        };
+        crate::PoliciesV3::<Test>::insert(&scope, edited.clone());
+        DeliveryPolicy::on_runtime_upgrade();
+        assert_eq!(DeliveryPolicy::on_chain_storage_version(), StorageVersion::new(8));
+        assert_eq!(PersonaPoliciesV2::<Test>::get(&name), Some(legacy));
+        assert_eq!(crate::PoliciesV3::<Test>::get(&scope), Some(edited));
+    });
 }

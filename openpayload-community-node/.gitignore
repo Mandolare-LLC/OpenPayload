@@ -1,0 +1,7 @@
+# Required upstream DNS test fixtures; all other key files stay ignored.
+!/vendor/hickory-proto-0.24.4/tests/test-data/rfc4034-2.3.key
+!/vendor/hickory-proto-0.24.4/tests/test-data/rfc4034-5.4.key
+!/vendor/hickory-proto-0.25.2/tests/test-data/rfc4034-2.3.key
+!/vendor/hickory-proto-0.25.2/tests/test-data/rfc4034-5.4.key
+!/vendor/hickory-proto-0.25.2/tests/test-data/root.key
+!/vendor/hickory-proto-0.25.2/tests/test-data/rsa-2048-pkcs1.pem

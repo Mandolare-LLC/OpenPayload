@@ -31,4 +31,7 @@ frame_benchmarking::define_benchmarks!(
     [pallet_timestamp, Timestamp]
     [pallet_sudo, Sudo]
     [pallet_resource_rewards, ResourceRewards]
+    [pallet_did_registry, DidRegistry]
+    [pallet_application_registry, ApplicationRegistry]
+    [pallet_delivery_policy, DeliveryPolicy]
 );

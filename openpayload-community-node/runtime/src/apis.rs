@@ -82,6 +82,9 @@ impl_runtime_apis! {
     }
 
     impl pallet_delivery_policy::DeliveryPolicyRuntimeApi<Block> for Runtime {
+        fn verify_dnssec_txt(record_name: Vec<u8>, record_value: Vec<u8>, proof: Vec<u8>) -> Option<u64> {
+            DeliveryPolicy::verify_dnssec_txt(record_name, record_value, proof)
+        }
         fn resolve_delivery_policy(
             recipient: Vec<u8>,
             persona: Option<Vec<u8>>,

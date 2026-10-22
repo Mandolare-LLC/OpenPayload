@@ -16,15 +16,26 @@ use sp_runtime::transaction_validity::{
     InvalidTransaction, TransactionValidity, TransactionValidityWithRefund, ValidTransaction,
 };
 
+/// v2 registration binds alias, root key and the exact document blob.
+pub fn registration_payload(
+    did: &[u8],
+    alias: Option<&[u8]>,
+    key: &[u8],
+    document: &[u8],
+    timestamp: &[u8],
+) -> Vec<u8> {
+    let mut payload = b"openpayload:register:v2|".to_vec();
+    payload.extend(did.to_vec().encode());
+    payload.extend(alias.map(|v| v.to_vec()).encode());
+    payload.extend(key.to_vec().encode());
+    payload.extend(sp_io::hashing::blake2_256(document));
+    payload.extend(timestamp.to_vec().encode());
+    payload
+}
+
 // Canonical OpenPayload DID grammar:
-// `did:<platform>:<base58-address>`.
-//
-// The platform is intentionally not fixed to `openpayload`; independent networks may
-// choose their own lowercase name. Component limits provide deterministic bounds
-// below the runtime's overall MaxDidLen limit.
-const DID_PREFIX: &[u8] = b"did:";
-const MIN_DID_PLATFORM_LEN: usize = 1;
-const MAX_DID_PLATFORM_LEN: usize = 32;
+// `did:openpayload:<base58-address>`. Other DID methods are unsupported.
+const DID_PREFIX: &[u8] = b"did:openpayload:";
 const MIN_DID_ADDRESS_LEN: usize = 16;
 const MAX_DID_ADDRESS_LEN: usize = 96;
 
@@ -57,6 +68,19 @@ where
     }
 }
 
+mod input;
+pub mod weights;
+
+#[cfg(feature = "runtime-benchmarks")]
+mod benchmarking;
+
+#[cfg(feature = "runtime-benchmarks")]
+pub trait BenchmarkHelper {
+    fn install_policy(_did: &[u8]) {}
+    fn public() -> Vec<u8>;
+    fn sign(payload: &[u8]) -> Vec<u8>;
+}
+
 #[cfg(test)]
 mod mock;
 #[cfg(test)]
@@ -70,11 +94,14 @@ pub mod pallet {
     pub trait Config:
         frame_system::Config<RuntimeEvent: From<Event<Self>>> + pallet_timestamp::Config
     {
+        #[cfg(feature = "runtime-benchmarks")]
+        type BenchmarkHelper: BenchmarkHelper;
+
         // Length/size limits
         #[pallet::constant]
         type MaxDidLen: Get<u32>;
         #[pallet::constant]
-        type MaxDevices: Get<u32>;
+        type MaxLegacyDevices: Get<u32>;
         #[pallet::constant]
         type MaxAliasLen: Get<u32>;
         #[pallet::constant]
@@ -261,6 +288,47 @@ pub mod pallet {
     #[codec(mel_bound())]
     #[codec(decode_bound())]
     #[codec(decode_with_mem_tracking_bound())]
+    pub struct DeviceKeyAgreementOverride<T: Config> {
+        pub active: KeyAgreement<T>,
+        pub rotation: Option<KeyAgreement<T>>,
+    }
+
+    #[derive(
+        Encode,
+        Decode,
+        DecodeWithMemTracking,
+        Clone,
+        PartialEq,
+        Eq,
+        DebugNoBound,
+        TypeInfo,
+        MaxEncodedLen,
+    )]
+    #[scale_info(skip_type_params(T))]
+    #[codec(mel_bound())]
+    #[codec(decode_bound())]
+    #[codec(decode_with_mem_tracking_bound())]
+    pub struct DeviceRecord<T: Config> {
+        pub info: DeviceInfo,
+        pub key_agreement_override: Option<DeviceKeyAgreementOverride<T>>,
+        pub revision: u64,
+    }
+
+    #[derive(
+        Encode,
+        Decode,
+        DecodeWithMemTracking,
+        Clone,
+        PartialEq,
+        Eq,
+        DebugNoBound,
+        TypeInfo,
+        MaxEncodedLen,
+    )]
+    #[scale_info(skip_type_params(T))]
+    #[codec(mel_bound())]
+    #[codec(decode_bound())]
+    #[codec(decode_with_mem_tracking_bound())]
     pub struct DeliveryPolicyLinks<T: Config> {
         pub recipient_policy: Option<PolicyRefOf<T>>,
         pub tag_policies: PolicyRefListOf<T>,
@@ -320,6 +388,10 @@ pub mod pallet {
         },
         ClearDeliveryPolicyLinks,
         DeleteDid,
+        SetDeviceKeyAgreement {
+            device_id: DeviceIdOf,
+            key_agreement_override: Option<DeviceKeyAgreementOverride<T>>,
+        },
     }
 
     #[derive(
@@ -407,7 +479,8 @@ pub mod pallet {
     pub struct DidRecord<T: Config> {
         pub owner: Option<T::AccountId>,
         pub aliases: Option<AliasListOf<T>>,
-        pub devices: Option<BoundedVec<DeviceInfo, T::MaxDevices>>,
+        /// Legacy encoding retained for bounded, lazy migration. New writes use Devices.
+        pub devices: Option<BoundedVec<DeviceInfo, T::MaxLegacyDevices>>,
         pub document: Option<DidDocument<T>>,
         pub version: u64,
         pub updated_at: u64,
@@ -421,6 +494,48 @@ pub mod pallet {
 
     #[pallet::storage]
     pub type Dids<T: Config> = StorageMap<_, Blake2_128Concat, DidOf<T>, DidRecord<T>, OptionQuery>;
+
+    /// One independently addressable record per DID/device pair. No per-DID vector cap.
+    #[pallet::storage]
+    pub type Devices<T: Config> = StorageDoubleMap<
+        _,
+        Blake2_128Concat,
+        DidOf<T>,
+        Blake2_128Concat,
+        DeviceIdOf,
+        DeviceRecord<T>,
+        OptionQuery,
+    >;
+
+    /// Bounded removal after DID deletion. Re-registration waits for cleanup.
+    #[pallet::storage]
+    pub type PendingDeviceCleanup<T: Config> =
+        StorageMap<_, Blake2_128Concat, DidOf<T>, (), OptionQuery>;
+
+    #[pallet::hooks]
+    impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
+        fn on_idle(_n: BlockNumberFor<T>, remaining: Weight) -> Weight {
+            let budget = T::DbWeight::get()
+                .reads_writes(35, 34)
+                .saturating_add(Weight::from_parts(100_000_000, 300_000));
+            if !budget.all_lte(remaining) {
+                return Weight::zero();
+            }
+            let Some(did) = PendingDeviceCleanup::<T>::iter_keys().next() else {
+                return T::DbWeight::get().reads(1);
+            };
+            // clear_prefix also clears overlay entries without its limit. Explicit
+            // key iteration bounds work even for devices added earlier in this block.
+            let keys: Vec<_> = Devices::<T>::iter_key_prefix(&did).take(32).collect();
+            for key in keys {
+                Devices::<T>::remove(&did, key);
+            }
+            if Devices::<T>::iter_key_prefix(&did).next().is_none() {
+                PendingDeviceCleanup::<T>::remove(&did);
+            }
+            budget
+        }
+    }
 
     #[pallet::storage]
     pub type AliasIndex<T: Config> =
@@ -474,6 +589,7 @@ pub mod pallet {
         DeliveryPolicyLinksCleared(DidOf<T>),
         DidDeactivated(DidOf<T>),
         DidDeleted(DidOf<T>),
+        DeviceKeyAgreementSet(DidOf<T>, DeviceIdOf),
     }
 
     #[pallet::error]
@@ -523,6 +639,9 @@ pub mod pallet {
         TooManyPolicyRefs,
         InvalidDidFormat,
         DidControlsApplication,
+        DeviceCleanupPending,
+        InvalidDeviceKeyAgreement,
+        DeviceRevisionOverflow,
     }
 
     #[pallet::call]
@@ -566,83 +685,36 @@ pub mod pallet {
         }
 
         #[pallet::call_index(2)]
-        #[pallet::weight(T::DbWeight::get().reads_writes(2,2))]
+        #[pallet::weight(Pallet::<T>::device_registry_weight())]
+        #[frame_support::transactional]
         pub fn add_device(
             origin: OriginFor<T>,
             did: Vec<u8>,
             device_id: Vec<u8>,
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
-            let did_b = DidOf::<T>::try_from(did).map_err(|_| Error::<T>::DidTooLong)?;
-            Self::ensure_did_owner(&who, &did_b)?;
-            let dev_b: BoundedVec<u8, ConstU32<64>> =
-                device_id.try_into().map_err(|_| Error::<T>::DidTooLong)?;
-
-            Dids::<T>::try_mutate(&did_b, |maybe| -> DispatchResult {
-                let rec = maybe.as_mut().ok_or(Error::<T>::DidNotFound)?;
-                let mut list = rec.devices.take().unwrap_or_default();
-                let mut found = false;
-                for d in &mut list {
-                    if d.device_id == dev_b {
-                        d.tombstoned = false;
-                        found = true;
-                        break;
-                    }
-                }
-                if !found {
-                    ensure!(
-                        (list.len() as u32) < T::MaxDevices::get(),
-                        Error::<T>::TooManyDevices
-                    );
-                    list.try_push(DeviceInfo {
-                        device_id: dev_b.clone(),
-                        added_at: now_millis::<T>(),
-                        tombstoned: false,
-                    })
-                    .map_err(|_| Error::<T>::TooManyDevices)?;
-                }
-                rec.devices = Some(list);
-                rec.version = rec.version.saturating_add(1);
-                rec.updated_at = now_millis::<T>();
-                Ok(())
-            })?;
-
-            Self::deposit_event(Event::DeviceAdded(did_b, dev_b.clone()));
+            let did = DidOf::<T>::try_from(did).map_err(|_| Error::<T>::DidTooLong)?;
+            Self::ensure_did_owner(&who, &did)?;
+            let device = Self::bounded_device_id(device_id)?;
+            Self::register_device(&did, &device)?;
+            Self::deposit_event(Event::DeviceAdded(did, device));
             Ok(())
         }
 
         #[pallet::call_index(3)]
-        #[pallet::weight(T::DbWeight::get().reads_writes(2,2))]
+        #[pallet::weight(Pallet::<T>::device_registry_weight())]
+        #[frame_support::transactional]
         pub fn tombstone_device(
             origin: OriginFor<T>,
             did: Vec<u8>,
             device_id: Vec<u8>,
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
-            let did_b = DidOf::<T>::try_from(did).map_err(|_| Error::<T>::DidTooLong)?;
-            Self::ensure_did_owner(&who, &did_b)?;
-            let dev_b: BoundedVec<u8, ConstU32<64>> =
-                device_id.try_into().map_err(|_| Error::<T>::DidTooLong)?;
-
-            Dids::<T>::try_mutate(&did_b, |maybe| -> DispatchResult {
-                let rec = maybe.as_mut().ok_or(Error::<T>::DidNotFound)?;
-                let mut list = rec.devices.take().ok_or(Error::<T>::DeviceNotFound)?;
-                let mut found = false;
-                for d in &mut list {
-                    if d.device_id == dev_b {
-                        d.tombstoned = true;
-                        found = true;
-                        break;
-                    }
-                }
-                ensure!(found, Error::<T>::DeviceNotFound);
-                rec.devices = Some(list);
-                rec.version = rec.version.saturating_add(1);
-                rec.updated_at = now_millis::<T>();
-                Ok(())
-            })?;
-
-            Self::deposit_event(Event::DeviceTombstoned(did_b, dev_b.clone()));
+            let did = DidOf::<T>::try_from(did).map_err(|_| Error::<T>::DidTooLong)?;
+            Self::ensure_did_owner(&who, &did)?;
+            let device = Self::bounded_device_id(device_id)?;
+            Self::tombstone_device_record(&did, &device)?;
+            Self::deposit_event(Event::DeviceTombstoned(did, device));
             Ok(())
         }
 
@@ -671,7 +743,8 @@ pub mod pallet {
         }
 
         #[pallet::call_index(27)]
-        #[pallet::weight(T::DbWeight::get().reads_writes(2,2))]
+        #[pallet::weight(Pallet::<T>::device_registry_weight())]
+        #[frame_support::transactional]
         pub fn update_device(
             origin: OriginFor<T>,
             did: Vec<u8>,
@@ -679,67 +752,35 @@ pub mod pallet {
             new_device_id: Vec<u8>,
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
-            let did_b = DidOf::<T>::try_from(did).map_err(|_| Error::<T>::DidTooLong)?;
-            Self::ensure_did_owner(&who, &did_b)?;
-            let old_b = Self::bounded_device_id(old_device_id)?;
-            let new_b = Self::bounded_device_id(new_device_id)?;
-            ensure!(old_b != new_b, Error::<T>::DeviceAlreadyExists);
-
-            Dids::<T>::try_mutate(&did_b, |maybe| -> DispatchResult {
-                let rec = maybe.as_mut().ok_or(Error::<T>::DidNotFound)?;
-                let mut list = rec.devices.take().ok_or(Error::<T>::DeviceNotFound)?;
-                ensure!(
-                    !list.iter().any(|device| device.device_id == new_b),
-                    Error::<T>::DeviceAlreadyExists
-                );
-                let pos = list
-                    .iter()
-                    .position(|device| device.device_id == old_b)
-                    .ok_or(Error::<T>::DeviceNotFound)?;
-                list[pos].device_id = new_b.clone();
-                rec.devices = Some(list);
-                rec.version = rec.version.saturating_add(1);
-                rec.updated_at = now_millis::<T>();
-                Ok(())
-            })?;
-
-            Self::deposit_event(Event::DeviceUpdated(did_b, old_b, new_b));
+            let did = DidOf::<T>::try_from(did).map_err(|_| Error::<T>::DidTooLong)?;
+            Self::ensure_did_owner(&who, &did)?;
+            let old = Self::bounded_device_id(old_device_id)?;
+            let new = Self::bounded_device_id(new_device_id)?;
+            Self::rename_device(&did, &old, &new)?;
+            Self::deposit_event(Event::DeviceUpdated(did, old, new));
             Ok(())
         }
 
         #[pallet::call_index(28)]
-        #[pallet::weight(T::DbWeight::get().reads_writes(2,2))]
+        #[pallet::weight(Pallet::<T>::device_registry_weight())]
+        #[frame_support::transactional]
         pub fn remove_device(
             origin: OriginFor<T>,
             did: Vec<u8>,
             device_id: Vec<u8>,
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
-            let did_b = DidOf::<T>::try_from(did).map_err(|_| Error::<T>::DidTooLong)?;
-            Self::ensure_did_owner(&who, &did_b)?;
-            let dev_b = Self::bounded_device_id(device_id)?;
-
-            Dids::<T>::try_mutate(&did_b, |maybe| -> DispatchResult {
-                let rec = maybe.as_mut().ok_or(Error::<T>::DidNotFound)?;
-                let mut list = rec.devices.take().ok_or(Error::<T>::DeviceNotFound)?;
-                let pos = list
-                    .iter()
-                    .position(|device| device.device_id == dev_b)
-                    .ok_or(Error::<T>::DeviceNotFound)?;
-                list.remove(pos);
-                rec.devices = if list.is_empty() { None } else { Some(list) };
-                rec.version = rec.version.saturating_add(1);
-                rec.updated_at = now_millis::<T>();
-                Ok(())
-            })?;
-
-            Self::deposit_event(Event::DeviceRemoved(did_b, dev_b));
+            let did = DidOf::<T>::try_from(did).map_err(|_| Error::<T>::DidTooLong)?;
+            Self::ensure_did_owner(&who, &did)?;
+            let device = Self::bounded_device_id(device_id)?;
+            Self::remove_device_record(&did, &device)?;
+            Self::deposit_event(Event::DeviceRemoved(did, device));
             Ok(())
         }
 
         /// Set the full W3C DID Document (structured) via SCALE-encoded blob
         #[pallet::call_index(4)]
-        #[pallet::weight(T::DbWeight::get().reads_writes(2,2))]
+        #[pallet::weight(T::DbWeight::get().reads_writes(2,2).saturating_add(Pallet::<T>::input_validation_weight()))]
         pub fn set_document(
             origin: OriginFor<T>,
             did: Vec<u8>,
@@ -757,6 +798,10 @@ pub mod pallet {
             let doc =
                 DidDocument::<T>::decode(&mut bytes).map_err(|_| Error::<T>::InvalidDocument)?;
 
+            ensure!(
+                bytes.is_empty() && doc.encode().as_slice() == doc_bounded.as_slice(),
+                Error::<T>::InvalidDocument
+            );
             Self::validate_document_structure(&did_b, &doc)?;
 
             Dids::<T>::try_mutate(&did_b, |maybe| -> DispatchResult {
@@ -768,13 +813,14 @@ pub mod pallet {
                 Ok(())
             })?;
 
+            Self::finish_document_patch(&did_b, DocumentNonces::<T>::get(&did_b));
             Self::deposit_event(Event::DocumentSet(did_b));
             Ok(())
         }
 
         /// Set the full W3C DID Document (structured) via SCALE-encoded blob
         #[pallet::call_index(5)]
-        #[pallet::weight(T::DbWeight::get().reads_writes(2,2))]
+        #[pallet::weight(T::DbWeight::get().reads_writes(2,2).saturating_add(Pallet::<T>::input_validation_weight()))]
         #[pallet::authorize(|_source, did, doc_blob, timestamp, pubkey, signature| {
             Self::authorize_unsigned_call(&Call::set_document_with_proof {
                 did: did.clone(),
@@ -784,7 +830,7 @@ pub mod pallet {
                 signature: signature.clone(),
             })
         })]
-        #[pallet::weight_of_authorize(T::DbWeight::get().reads_writes(1,1))]
+        #[pallet::weight_of_authorize(T::DbWeight::get().reads_writes(1,1).saturating_add(Pallet::<T>::input_validation_weight()))]
         pub fn set_document_with_proof(
             origin: OriginFor<T>,
             did: Vec<u8>,
@@ -795,6 +841,15 @@ pub mod pallet {
         ) -> DispatchResult {
             Self::ensure_unsigned_or_authorized(origin)?;
 
+            let nonce = input::proof_nonce(&timestamp, now_millis::<T>())
+                .filter(|nonce| *nonce < u64::MAX)
+                .ok_or(Error::<T>::DocumentAuthorizationExpired)?;
+            let did_for_nonce =
+                DidOf::<T>::try_from(did.clone()).map_err(|_| Error::<T>::DidTooLong)?;
+            ensure!(
+                nonce == DocumentNonces::<T>::get(&did_for_nonce),
+                Error::<T>::InvalidDocumentNonce
+            );
             // Basic size checks
             ensure!(
                 pubkey.len() == 32 && signature.len() == 64,
@@ -802,11 +857,11 @@ pub mod pallet {
             );
 
             // Bind the signature to DID + content + op + time
-            // domain = "openpayload:set_document:v1|"
+            // domain = "openpayload:set_document:v2|"
             let mut payload = Vec::with_capacity(
-                b"openpayload:set_document:v1|".len() + did.len() + 1 + 32 + 1 + timestamp.len(),
+                b"openpayload:set_document:v2|".len() + did.len() + 1 + 32 + 1 + timestamp.len(),
             );
-            payload.extend_from_slice(b"openpayload:set_document:v1|");
+            payload.extend_from_slice(b"openpayload:set_document:v2|");
             payload.extend_from_slice(&did);
             payload.push(b'|');
 
@@ -823,6 +878,10 @@ pub mod pallet {
             let mut bytes = &doc_bounded[..];
             let doc =
                 DidDocument::<T>::decode(&mut bytes).map_err(|_| Error::<T>::InvalidDocument)?;
+            ensure!(
+                bytes.is_empty() && doc.encode().as_slice() == doc_bounded.as_slice(),
+                Error::<T>::InvalidDocument
+            );
             Self::validate_document_structure(&did_b, &doc)?;
 
             // Write the document
@@ -851,12 +910,13 @@ pub mod pallet {
                 Ok(())
             })?;
 
+            Self::finish_document_patch(&did_b, nonce);
             Self::deposit_event(Event::DocumentSet(did_b));
             Ok(())
         }
 
         #[pallet::call_index(6)]
-        #[pallet::weight(T::DbWeight::get().reads_writes(3,3))]
+        #[pallet::weight(T::DbWeight::get().reads_writes(3,3).saturating_add(Pallet::<T>::input_validation_weight()))]
         #[pallet::authorize(|_source, did, alias, timestamp, pubkey, signature, doc_blob| {
             Self::authorize_unsigned_call(&Call::register_with_document_proof {
                 did: did.clone(),
@@ -867,7 +927,7 @@ pub mod pallet {
                 doc_blob: doc_blob.clone(),
             })
         })]
-        #[pallet::weight_of_authorize(T::DbWeight::get().reads_writes(1,1))]
+        #[pallet::weight_of_authorize(T::DbWeight::get().reads_writes(1,1).saturating_add(Pallet::<T>::input_validation_weight()))]
         pub fn register_with_document_proof(
             origin: OriginFor<T>,
             did: Vec<u8>,
@@ -892,7 +952,7 @@ pub mod pallet {
         }
 
         #[pallet::call_index(7)]
-        #[pallet::weight(T::DbWeight::get().reads_writes(3,3))]
+        #[pallet::weight(T::DbWeight::get().reads_writes(3,3).saturating_add(Pallet::<T>::input_validation_weight()))]
         pub fn register_with_document_proof_signed(
             origin: OriginFor<T>,
             did: Vec<u8>,
@@ -971,7 +1031,7 @@ pub mod pallet {
         }
 
         #[pallet::call_index(10)]
-        #[pallet::weight(T::DbWeight::get().reads_writes(2,2))]
+        #[pallet::weight(T::DbWeight::get().reads_writes(2,2).saturating_add(Pallet::<T>::input_validation_weight()))]
         #[pallet::authorize(|_source, did, alias, timestamp, pubkey, signature| {
             Self::authorize_unsigned_call(&Call::register_with_proof {
                 did: did.clone(),
@@ -981,7 +1041,7 @@ pub mod pallet {
                 signature: signature.clone(),
             })
         })]
-        #[pallet::weight_of_authorize(T::DbWeight::get().reads_writes(1,1))]
+        #[pallet::weight_of_authorize(T::DbWeight::get().reads_writes(1,1).saturating_add(Pallet::<T>::input_validation_weight()))]
         pub fn register_with_proof(
             origin: OriginFor<T>,
             did: Vec<u8>,
@@ -999,12 +1059,24 @@ pub mod pallet {
 
             let did_b = Self::validated_registration_did(did.clone())?;
             ensure!(
+                !PendingDeviceCleanup::<T>::contains_key(&did_b),
+                Error::<T>::DeviceCleanupPending
+            );
+            ensure!(
                 !Dids::<T>::contains_key(&did_b),
                 Error::<T>::DidAlreadyExists
             );
 
             ensure!(
-                verify_did_signature(&did, &timestamp, &pubkey, &signature),
+                input::proof_nonce(&timestamp, now_millis::<T>()) == Some(0)
+                    && verify_registration(
+                        &did,
+                        alias.as_deref(),
+                        &timestamp,
+                        &pubkey,
+                        &signature,
+                        &[]
+                    ),
                 Error::<T>::InvalidSignature
             );
 
@@ -1141,7 +1213,7 @@ pub mod pallet {
         }
 
         #[pallet::call_index(14)]
-        #[pallet::weight(T::DbWeight::get().reads_writes(2,2))]
+        #[pallet::weight(T::DbWeight::get().reads_writes(2,2).saturating_add(Pallet::<T>::input_validation_weight()))]
         #[pallet::authorize(|_source, did, method, signed_payload, signature, signer_key_id| {
             Self::authorize_unsigned_call(&Call::add_verification_method {
                 did: did.clone(),
@@ -1151,7 +1223,7 @@ pub mod pallet {
                 signer_key_id: signer_key_id.clone(),
             })
         })]
-        #[pallet::weight_of_authorize(T::DbWeight::get().reads_writes(1,1))]
+        #[pallet::weight_of_authorize(T::DbWeight::get().reads_writes(1,1).saturating_add(Pallet::<T>::input_validation_weight()))]
         pub fn add_verification_method(
             origin: OriginFor<T>,
             did: Vec<u8>,
@@ -1176,7 +1248,7 @@ pub mod pallet {
         }
 
         #[pallet::call_index(15)]
-        #[pallet::weight(T::DbWeight::get().reads_writes(2,2))]
+        #[pallet::weight(T::DbWeight::get().reads_writes(2,2).saturating_add(Pallet::<T>::input_validation_weight()))]
         #[pallet::authorize(|_source, did, method, signed_payload, signature, signer_key_id| {
             Self::authorize_unsigned_call(&Call::update_verification_method {
                 did: did.clone(),
@@ -1186,7 +1258,7 @@ pub mod pallet {
                 signer_key_id: signer_key_id.clone(),
             })
         })]
-        #[pallet::weight_of_authorize(T::DbWeight::get().reads_writes(1,1))]
+        #[pallet::weight_of_authorize(T::DbWeight::get().reads_writes(1,1).saturating_add(Pallet::<T>::input_validation_weight()))]
         pub fn update_verification_method(
             origin: OriginFor<T>,
             did: Vec<u8>,
@@ -1211,7 +1283,7 @@ pub mod pallet {
         }
 
         #[pallet::call_index(16)]
-        #[pallet::weight(T::DbWeight::get().reads_writes(2,2))]
+        #[pallet::weight(T::DbWeight::get().reads_writes(2,2).saturating_add(Pallet::<T>::input_validation_weight()))]
         #[pallet::authorize(|_source, did, method_id, signed_payload, signature, signer_key_id| {
             Self::authorize_unsigned_call(&Call::remove_verification_method {
                 did: did.clone(),
@@ -1221,7 +1293,7 @@ pub mod pallet {
                 signer_key_id: signer_key_id.clone(),
             })
         })]
-        #[pallet::weight_of_authorize(T::DbWeight::get().reads_writes(1,1))]
+        #[pallet::weight_of_authorize(T::DbWeight::get().reads_writes(1,1).saturating_add(Pallet::<T>::input_validation_weight()))]
         pub fn remove_verification_method(
             origin: OriginFor<T>,
             did: Vec<u8>,
@@ -1248,7 +1320,7 @@ pub mod pallet {
         }
 
         #[pallet::call_index(17)]
-        #[pallet::weight(T::DbWeight::get().reads_writes(2,2))]
+        #[pallet::weight(T::DbWeight::get().reads_writes(2,2).saturating_add(Pallet::<T>::input_validation_weight()))]
         #[pallet::authorize(|_source, did, method_id, signed_payload, signature, signer_key_id| {
             Self::authorize_unsigned_call(&Call::add_authentication {
                 did: did.clone(),
@@ -1258,7 +1330,7 @@ pub mod pallet {
                 signer_key_id: signer_key_id.clone(),
             })
         })]
-        #[pallet::weight_of_authorize(T::DbWeight::get().reads_writes(1,1))]
+        #[pallet::weight_of_authorize(T::DbWeight::get().reads_writes(1,1).saturating_add(Pallet::<T>::input_validation_weight()))]
         pub fn add_authentication(
             origin: OriginFor<T>,
             did: Vec<u8>,
@@ -1285,7 +1357,7 @@ pub mod pallet {
         }
 
         #[pallet::call_index(18)]
-        #[pallet::weight(T::DbWeight::get().reads_writes(2,2))]
+        #[pallet::weight(T::DbWeight::get().reads_writes(2,2).saturating_add(Pallet::<T>::input_validation_weight()))]
         #[pallet::authorize(|_source, did, method_id, signed_payload, signature, signer_key_id| {
             Self::authorize_unsigned_call(&Call::remove_authentication {
                 did: did.clone(),
@@ -1295,7 +1367,7 @@ pub mod pallet {
                 signer_key_id: signer_key_id.clone(),
             })
         })]
-        #[pallet::weight_of_authorize(T::DbWeight::get().reads_writes(1,1))]
+        #[pallet::weight_of_authorize(T::DbWeight::get().reads_writes(1,1).saturating_add(Pallet::<T>::input_validation_weight()))]
         pub fn remove_authentication(
             origin: OriginFor<T>,
             did: Vec<u8>,
@@ -1322,7 +1394,7 @@ pub mod pallet {
         }
 
         #[pallet::call_index(19)]
-        #[pallet::weight(T::DbWeight::get().reads_writes(2,2))]
+        #[pallet::weight(T::DbWeight::get().reads_writes(2,2).saturating_add(Pallet::<T>::input_validation_weight()))]
         #[pallet::authorize(|_source, did, key_agreement, signed_payload, signature, signer_key_id| {
             Self::authorize_unsigned_call(&Call::add_key_agreement {
                 did: did.clone(),
@@ -1332,7 +1404,7 @@ pub mod pallet {
                 signer_key_id: signer_key_id.clone(),
             })
         })]
-        #[pallet::weight_of_authorize(T::DbWeight::get().reads_writes(1,1))]
+        #[pallet::weight_of_authorize(T::DbWeight::get().reads_writes(1,1).saturating_add(Pallet::<T>::input_validation_weight()))]
         pub fn add_key_agreement(
             origin: OriginFor<T>,
             did: Vec<u8>,
@@ -1357,7 +1429,7 @@ pub mod pallet {
         }
 
         #[pallet::call_index(20)]
-        #[pallet::weight(T::DbWeight::get().reads_writes(2,2))]
+        #[pallet::weight(T::DbWeight::get().reads_writes(2,2).saturating_add(Pallet::<T>::input_validation_weight()))]
         #[pallet::authorize(|_source, did, key_agreement, signed_payload, signature, signer_key_id| {
             Self::authorize_unsigned_call(&Call::update_key_agreement {
                 did: did.clone(),
@@ -1367,7 +1439,7 @@ pub mod pallet {
                 signer_key_id: signer_key_id.clone(),
             })
         })]
-        #[pallet::weight_of_authorize(T::DbWeight::get().reads_writes(1,1))]
+        #[pallet::weight_of_authorize(T::DbWeight::get().reads_writes(1,1).saturating_add(Pallet::<T>::input_validation_weight()))]
         pub fn update_key_agreement(
             origin: OriginFor<T>,
             did: Vec<u8>,
@@ -1392,7 +1464,7 @@ pub mod pallet {
         }
 
         #[pallet::call_index(21)]
-        #[pallet::weight(T::DbWeight::get().reads_writes(2,2))]
+        #[pallet::weight(T::DbWeight::get().reads_writes(2,2).saturating_add(Pallet::<T>::input_validation_weight()))]
         #[pallet::authorize(|_source, did, key_agreement_id, signed_payload, signature, signer_key_id| {
             Self::authorize_unsigned_call(&Call::remove_key_agreement {
                 did: did.clone(),
@@ -1402,7 +1474,7 @@ pub mod pallet {
                 signer_key_id: signer_key_id.clone(),
             })
         })]
-        #[pallet::weight_of_authorize(T::DbWeight::get().reads_writes(1,1))]
+        #[pallet::weight_of_authorize(T::DbWeight::get().reads_writes(1,1).saturating_add(Pallet::<T>::input_validation_weight()))]
         pub fn remove_key_agreement(
             origin: OriginFor<T>,
             did: Vec<u8>,
@@ -1429,7 +1501,7 @@ pub mod pallet {
         }
 
         #[pallet::call_index(22)]
-        #[pallet::weight(T::DbWeight::get().reads_writes(2,2))]
+        #[pallet::weight(T::DbWeight::get().reads_writes(2,2).saturating_add(Pallet::<T>::input_validation_weight()))]
         #[pallet::authorize(|_source, did, service, signed_payload, signature, signer_key_id| {
             Self::authorize_unsigned_call(&Call::add_service {
                 did: did.clone(),
@@ -1439,7 +1511,7 @@ pub mod pallet {
                 signer_key_id: signer_key_id.clone(),
             })
         })]
-        #[pallet::weight_of_authorize(T::DbWeight::get().reads_writes(1,1))]
+        #[pallet::weight_of_authorize(T::DbWeight::get().reads_writes(1,1).saturating_add(Pallet::<T>::input_validation_weight()))]
         pub fn add_service(
             origin: OriginFor<T>,
             did: Vec<u8>,
@@ -1464,7 +1536,7 @@ pub mod pallet {
         }
 
         #[pallet::call_index(23)]
-        #[pallet::weight(T::DbWeight::get().reads_writes(2,2))]
+        #[pallet::weight(T::DbWeight::get().reads_writes(2,2).saturating_add(Pallet::<T>::input_validation_weight()))]
         #[pallet::authorize(|_source, did, service, signed_payload, signature, signer_key_id| {
             Self::authorize_unsigned_call(&Call::update_service {
                 did: did.clone(),
@@ -1474,7 +1546,7 @@ pub mod pallet {
                 signer_key_id: signer_key_id.clone(),
             })
         })]
-        #[pallet::weight_of_authorize(T::DbWeight::get().reads_writes(1,1))]
+        #[pallet::weight_of_authorize(T::DbWeight::get().reads_writes(1,1).saturating_add(Pallet::<T>::input_validation_weight()))]
         pub fn update_service(
             origin: OriginFor<T>,
             did: Vec<u8>,
@@ -1499,7 +1571,7 @@ pub mod pallet {
         }
 
         #[pallet::call_index(24)]
-        #[pallet::weight(T::DbWeight::get().reads_writes(2,2))]
+        #[pallet::weight(T::DbWeight::get().reads_writes(2,2).saturating_add(Pallet::<T>::input_validation_weight()))]
         #[pallet::authorize(|_source, did, service_id, signed_payload, signature, signer_key_id| {
             Self::authorize_unsigned_call(&Call::remove_service {
                 did: did.clone(),
@@ -1509,7 +1581,7 @@ pub mod pallet {
                 signer_key_id: signer_key_id.clone(),
             })
         })]
-        #[pallet::weight_of_authorize(T::DbWeight::get().reads_writes(1,1))]
+        #[pallet::weight_of_authorize(T::DbWeight::get().reads_writes(1,1).saturating_add(Pallet::<T>::input_validation_weight()))]
         pub fn remove_service(
             origin: OriginFor<T>,
             did: Vec<u8>,
@@ -1536,7 +1608,7 @@ pub mod pallet {
         }
 
         #[pallet::call_index(25)]
-        #[pallet::weight(T::DbWeight::get().reads_writes(2,2))]
+        #[pallet::weight(T::DbWeight::get().reads_writes(2,2).saturating_add(Pallet::<T>::input_validation_weight()))]
         #[pallet::authorize(|_source, did, new_root_pubkey, signed_payload, signature, signer_key_id| {
             Self::authorize_unsigned_call(&Call::update_root_pubkey {
                 did: did.clone(),
@@ -1546,7 +1618,7 @@ pub mod pallet {
                 signer_key_id: signer_key_id.clone(),
             })
         })]
-        #[pallet::weight_of_authorize(T::DbWeight::get().reads_writes(1,1))]
+        #[pallet::weight_of_authorize(T::DbWeight::get().reads_writes(1,1).saturating_add(Pallet::<T>::input_validation_weight()))]
         pub fn update_root_pubkey(
             origin: OriginFor<T>,
             did: Vec<u8>,
@@ -1572,10 +1644,7 @@ pub mod pallet {
         /// counterpart to the account-signed device, deactivation, and policy
         /// link calls above.
         #[pallet::call_index(29)]
-        #[pallet::weight(T::DbWeight::get().reads_writes(
-            5,
-            13u64.saturating_add(T::MaxAliases::get() as u64),
-        ))]
+        #[pallet::weight(Pallet::<T>::device_registry_weight())]
         #[pallet::authorize(|_source, signed_payload, signature, signer_key_id| {
             Self::authorize_unsigned_call(&Call::apply_control_with_proof {
                 signed_payload: signed_payload.clone(),
@@ -1583,7 +1652,8 @@ pub mod pallet {
                 signer_key_id: signer_key_id.clone(),
             })
         })]
-        #[pallet::weight_of_authorize(T::DbWeight::get().reads_writes(1,1))]
+        #[pallet::weight_of_authorize(Pallet::<T>::device_registry_weight())]
+        #[frame_support::transactional]
         pub fn apply_control_with_proof(
             origin: OriginFor<T>,
             signed_payload: Vec<u8>,
@@ -1611,6 +1681,7 @@ pub mod pallet {
             Self::normalize_alias(alias)
                 .ok()
                 .and_then(AliasIndex::<T>::get)
+                .filter(|did| Self::is_canonical_did(did))
         }
 
         pub fn aliases_of(did: &[u8]) -> Option<AliasListOf<T>> {
@@ -1632,22 +1703,142 @@ pub mod pallet {
                 .unwrap_or(false)
         }
 
-        pub fn device_of(did: &[u8], device_id: &[u8]) -> Option<DeviceInfo> {
-            let device_id = Self::bounded_device_id(device_id.to_vec()).ok()?;
-            Self::did_from_slice(did)
-                .and_then(Dids::<T>::get)
-                .and_then(|record| record.devices)
-                .and_then(|devices| {
-                    devices
-                        .into_iter()
-                        .find(|device| device.device_id == device_id)
-                })
+        pub fn device_record(did: &[u8], device_id: &[u8]) -> Option<DeviceRecord<T>> {
+            let did = Self::did_from_slice(did)?;
+            let id = Self::bounded_device_id(device_id.to_vec()).ok()?;
+            let record = Dids::<T>::get(&did)?;
+            if record.deactivated {
+                return None;
+            }
+            Devices::<T>::get(&did, &id).or_else(|| {
+                record
+                    .devices?
+                    .into_iter()
+                    .find(|d| d.device_id == id)
+                    .map(|info| DeviceRecord {
+                        info,
+                        key_agreement_override: None,
+                        revision: 1,
+                    })
+            })
         }
 
-        pub fn devices_of(did: &[u8]) -> Option<BoundedVec<DeviceInfo, T::MaxDevices>> {
-            Self::did_from_slice(did)
-                .and_then(Dids::<T>::get)
-                .and_then(|record| record.devices)
+        pub fn device_of(did: &[u8], device_id: &[u8]) -> Option<DeviceInfo> {
+            Self::device_record(did, device_id).map(|record| record.info)
+        }
+
+        /// At most the legacy MaxLegacyDevices entries are moved in any transaction.
+        fn migrate_devices(did: &DidOf<T>) -> DispatchResult {
+            let mut record = Dids::<T>::get(did).ok_or(Error::<T>::DidNotFound)?;
+            Self::ensure_did_active(&record)?;
+            if let Some(legacy) = record.devices.take() {
+                for info in legacy {
+                    if !Devices::<T>::contains_key(did, &info.device_id) {
+                        Devices::<T>::insert(
+                            did,
+                            &info.device_id.clone(),
+                            DeviceRecord::<T> {
+                                info,
+                                key_agreement_override: None,
+                                revision: 1,
+                            },
+                        );
+                    }
+                }
+                Dids::<T>::insert(did, record);
+            }
+            Ok(())
+        }
+
+        fn validate_device_keys(
+            did: &DidOf<T>,
+            keys: &DeviceKeyAgreementOverride<T>,
+        ) -> DispatchResult {
+            Self::validate_key_agreement(did, &keys.active)?;
+            ensure!(
+                keys.active.controller.as_slice() == did.as_slice()
+                    && input::component(did, &keys.active.id),
+                Error::<T>::InvalidDeviceKeyAgreement
+            );
+            if let Some(rotation) = &keys.rotation {
+                Self::validate_key_agreement(did, rotation)?;
+                ensure!(
+                    input::normalized(did, &rotation.id) != input::normalized(did, &keys.active.id)
+                        && rotation.controller.as_slice() == did.as_slice()
+                        && input::component(did, &rotation.id),
+                    Error::<T>::InvalidDeviceKeyAgreement
+                );
+            }
+            Ok(())
+        }
+
+        fn register_device(did: &DidOf<T>, id: &DeviceIdOf) -> DispatchResult {
+            ensure!(!id.is_empty(), Error::<T>::DeviceNotFound);
+            Self::migrate_devices(did)?;
+            Devices::<T>::try_mutate(did, id, |record| -> DispatchResult {
+                if let Some(record) = record.as_mut() {
+                    record.revision = record
+                        .revision
+                        .checked_add(1)
+                        .ok_or(Error::<T>::DeviceRevisionOverflow)?;
+                    record.info.tombstoned = false;
+                } else {
+                    *record = Some(DeviceRecord::<T> {
+                        info: DeviceInfo {
+                            device_id: id.clone(),
+                            added_at: now_millis::<T>(),
+                            tombstoned: false,
+                        },
+                        key_agreement_override: None,
+                        revision: 1,
+                    });
+                }
+                Ok(())
+            })
+        }
+
+        fn tombstone_device_record(did: &DidOf<T>, id: &DeviceIdOf) -> DispatchResult {
+            Self::migrate_devices(did)?;
+            Devices::<T>::try_mutate(did, id, |record| -> DispatchResult {
+                let device = record.as_mut().ok_or(Error::<T>::DeviceNotFound)?;
+                device.revision = device
+                    .revision
+                    .checked_add(1)
+                    .ok_or(Error::<T>::DeviceRevisionOverflow)?;
+                device.info.tombstoned = true;
+                Ok(())
+            })
+        }
+
+        fn rename_device(did: &DidOf<T>, old: &DeviceIdOf, new: &DeviceIdOf) -> DispatchResult {
+            ensure!(
+                old != new && !new.is_empty(),
+                Error::<T>::DeviceAlreadyExists
+            );
+            Self::migrate_devices(did)?;
+            ensure!(
+                !Devices::<T>::contains_key(did, new),
+                Error::<T>::DeviceAlreadyExists
+            );
+            let mut device = Devices::<T>::get(did, old).ok_or(Error::<T>::DeviceNotFound)?;
+            device.revision = device
+                .revision
+                .checked_add(1)
+                .ok_or(Error::<T>::DeviceRevisionOverflow)?;
+            device.info.device_id = new.clone();
+            Devices::<T>::remove(did, old);
+            Devices::<T>::insert(did, new, device);
+            Ok(())
+        }
+
+        fn remove_device_record(did: &DidOf<T>, id: &DeviceIdOf) -> DispatchResult {
+            Self::migrate_devices(did)?;
+            ensure!(
+                Devices::<T>::contains_key(did, id),
+                Error::<T>::DeviceNotFound
+            );
+            Devices::<T>::remove(did, id);
+            Ok(())
         }
 
         pub fn owner_of(did: &[u8]) -> Option<T::AccountId> {
@@ -1670,10 +1861,14 @@ pub mod pallet {
         }
 
         fn did_from_slice(did: &[u8]) -> Option<DidOf<T>> {
+            if !Self::is_canonical_did(did) {
+                return None;
+            }
             DidOf::<T>::try_from(did.to_vec()).ok()
         }
 
         fn ensure_did_owner(who: &T::AccountId, did: &DidOf<T>) -> DispatchResult {
+            ensure!(Self::is_canonical_did(did), Error::<T>::InvalidDidFormat);
             let rec = Dids::<T>::get(did).ok_or(Error::<T>::DidNotFound)?;
             Self::ensure_did_active(&rec)?;
             ensure!(rec.owner.as_ref() == Some(who), Error::<T>::NotDidOwner);
@@ -1701,7 +1896,15 @@ pub mod pallet {
         }
 
         fn bounded_root_pubkey(raw: Vec<u8>) -> Result<RootPubkeyOf, Error<T>> {
-            ensure!(raw.len() == 32, Error::<T>::InvalidRootPubkey);
+            ensure!(
+                raw.len() == 32
+                    && input::ed25519_point(
+                        raw.as_slice()
+                            .try_into()
+                            .map_err(|_| Error::<T>::InvalidRootPubkey)?
+                    ),
+                Error::<T>::InvalidRootPubkey
+            );
             RootPubkeyOf::try_from(raw).map_err(|_| Error::<T>::InvalidRootPubkey)
         }
 
@@ -1838,19 +2041,31 @@ pub mod pallet {
             did: &DidOf<T>,
             signer_key_id: &IdStrOf<T>,
         ) -> Option<[u8; 32]> {
+            if !Self::is_canonical_did(did) {
+                return None;
+            }
             if signer_key_id.as_slice() == b"root" {
                 let root = rec.root_pubkey.as_ref()?;
                 return root.as_slice().try_into().ok();
             }
 
             let doc = rec.document.as_ref()?;
+            if !doc.authentication.as_ref().is_some_and(|refs| {
+                refs.iter()
+                    .any(|r| input::normalized(did, r) == input::normalized(did, signer_key_id))
+            }) {
+                return None;
+            }
             doc.verification_method
                 .iter()
                 .find(|vm| {
-                    vm.id.as_slice() == signer_key_id.as_slice()
+                    input::normalized(did, &vm.id) == input::normalized(did, signer_key_id)
+                        && input::component(did, &vm.id)
                         && vm.controller.as_slice() == did.as_slice()
+                        && vm.type_.as_slice() == b"Ed25519VerificationKey2020"
                 })
-                .and_then(|vm| decode_ed25519_public_key(vm.public_key_multibase.as_slice()))
+                .and_then(|vm| input::signing_material(&vm.public_key_multibase))
+                .and_then(|material| decode_ed25519_public_key(&material))
         }
 
         fn apply_alias_add(checked: CheckedAliasAuthorization<T>) -> DispatchResult {
@@ -1993,11 +2208,23 @@ pub mod pallet {
                 Error::<T>::InvalidDocumentPayload
             );
             ensure!(
-                payload.valid_until > now_millis::<T>(),
+                payload.valid_until > now_millis::<T>()
+                    && payload.valid_until <= now_millis::<T>().saturating_add(3_600_000)
+                    && payload.nonce < u64::MAX,
                 Error::<T>::DocumentAuthorizationExpired
             );
 
             let rec = Dids::<T>::get(&did_b).ok_or(Error::<T>::DidNotFound)?;
+            if signer_key_id != b"root" {
+                ensure!(
+                    rec.document
+                        .as_ref()
+                        .and_then(|d| d.authentication.as_ref())
+                        .is_some_and(|refs| refs.iter().any(|r| input::normalized(&did_b, r)
+                            == input::normalized(&did_b, signer_key_id))),
+                    Error::<T>::InvalidSignature
+                );
+            }
             Self::ensure_did_active(&rec)?;
             ensure!(
                 payload.nonce == DocumentNonces::<T>::get(&did_b),
@@ -2030,29 +2257,68 @@ pub mod pallet {
             }
         }
 
+        // Measured, reproduced worst-case validation envelope with a 2x safety margin.
+        fn device_registry_weight() -> Weight {
+            <weights::SubstrateWeight<T> as weights::WeightInfo>::device_registry()
+                .saturating_mul(2)
+        }
+
+        fn input_validation_weight() -> Weight {
+            weights::validation_weight::<T>()
+        }
+
         fn validate_verification_method(
-            did: &DidOf<T>,
+            _did: &DidOf<T>,
             method: &VerificationMethod<T>,
         ) -> DispatchResult {
-            ensure!(!method.id.is_empty(), Error::<T>::InvalidDocument);
             ensure!(
-                method.controller.as_slice() == did.as_slice(),
-                Error::<T>::InvalidDocument
-            );
-            ensure!(!method.type_.is_empty(), Error::<T>::InvalidDocument);
-            ensure!(
-                !method.public_key_multibase.is_empty(),
+                method.encoded_size() <= 4096
+                    && input::record_key(
+                        &method.id,
+                        &method.type_,
+                        &method.controller,
+                        &method.public_key_multibase
+                    ),
                 Error::<T>::InvalidDocument
             );
             Ok(())
         }
 
-        fn validate_document_structure(did: &DidOf<T>, doc: &DidDocument<T>) -> DispatchResult {
+        pub(crate) fn validate_document_structure(
+            did: &DidOf<T>,
+            doc: &DidDocument<T>,
+        ) -> DispatchResult {
+            ensure!(Self::is_canonical_did(did), Error::<T>::InvalidDidFormat);
             ensure!(
                 doc.id.as_slice() == did.as_slice(),
                 Error::<T>::InvalidDocument
             );
 
+            ensure!(
+                doc.encoded_size() <= T::MaxDocLen::get() as usize,
+                Error::<T>::InvalidDocument
+            );
+            let mut ids = alloc::collections::BTreeSet::new();
+            for method in &doc.verification_method {
+                ensure!(
+                    ids.insert(input::normalized(did, &method.id)),
+                    Error::<T>::VerificationMethodAlreadyExists
+                );
+            }
+            for key in &doc.key_agreement {
+                ensure!(
+                    ids.insert(input::normalized(did, &key.id)),
+                    Error::<T>::KeyAgreementAlreadyExists
+                );
+            }
+            if let Some(services) = &doc.service {
+                for service in services {
+                    ensure!(
+                        ids.insert(input::normalized(did, &service.id)),
+                        Error::<T>::ServiceAlreadyExists
+                    );
+                }
+            }
             for (index, method) in doc.verification_method.iter().enumerate() {
                 Self::validate_verification_method(did, method)?;
                 ensure!(
@@ -2069,14 +2335,16 @@ pub mod pallet {
                     ensure!(
                         doc.verification_method
                             .iter()
-                            .any(|method| method.id.as_slice() == auth_id.as_slice()),
+                            .any(|method| input::normalized(did, &method.id)
+                                == input::normalized(did, auth_id)),
                         Error::<T>::VerificationMethodNotFound
                     );
                     ensure!(
                         !authentication
                             .iter()
                             .skip(index + 1)
-                            .any(|other| other == auth_id),
+                            .any(|other| input::normalized(did, other)
+                                == input::normalized(did, auth_id)),
                         Error::<T>::AuthenticationAlreadyExists
                     );
                 }
@@ -2096,6 +2364,37 @@ pub mod pallet {
             if let Some(services) = doc.service.as_ref() {
                 for (index, service) in services.iter().enumerate() {
                     Self::validate_service(service)?;
+                    if input::protected(&service.type_) {
+                        if let Some(refs) = &service.authorization {
+                            let mut seen = alloc::collections::BTreeSet::new();
+                            for reference in refs {
+                                let normalized = input::normalized(did, reference);
+                                ensure!(
+                                    input::component(did, reference)
+                                        && seen.insert(normalized.clone())
+                                        && doc.verification_method.iter().any(
+                                            |m| input::normalized(did, &m.id) == normalized
+                                                && input::component(did, &m.id)
+                                                && m.controller.as_slice() == did.as_slice()
+                                                && m.type_.as_slice()
+                                                    == b"Ed25519VerificationKey2020"
+                                                && input::signing_material(&m.public_key_multibase)
+                                                    .is_some()
+                                        ),
+                                    Error::<T>::InvalidDocument
+                                );
+                                if let Some(auth) = &doc.authentication {
+                                    ensure!(
+                                        auth.is_empty()
+                                            || auth
+                                                .iter()
+                                                .any(|r| input::normalized(did, r) == normalized),
+                                        Error::<T>::InvalidDocument
+                                    );
+                                }
+                            }
+                        }
+                    }
                     ensure!(
                         !services
                             .iter()
@@ -2110,33 +2409,76 @@ pub mod pallet {
         }
 
         fn validate_key_agreement(
-            did: &DidOf<T>,
+            _did: &DidOf<T>,
             key_agreement: &KeyAgreement<T>,
         ) -> DispatchResult {
-            ensure!(!key_agreement.id.is_empty(), Error::<T>::InvalidDocument);
             ensure!(
-                key_agreement.controller.as_slice() == did.as_slice(),
-                Error::<T>::InvalidDocument
-            );
-            ensure!(!key_agreement.type_.is_empty(), Error::<T>::InvalidDocument);
-            ensure!(
-                !key_agreement.public_key_multibase.is_empty(),
+                key_agreement.encoded_size() <= 4096
+                    && input::record_key(
+                        &key_agreement.id,
+                        &key_agreement.type_,
+                        &key_agreement.controller,
+                        &key_agreement.public_key_multibase
+                    ),
                 Error::<T>::InvalidDocument
             );
             Ok(())
         }
 
         fn validate_service(service: &Service<T>) -> DispatchResult {
-            ensure!(!service.id.is_empty(), Error::<T>::InvalidDocument);
-            ensure!(!service.type_.is_empty(), Error::<T>::InvalidDocument);
+            ensure!(
+                input::token(&service.id)
+                    && (service.id.starts_with(b"#")
+                        && service.id.len() > 1
+                        && input::uri(
+                            &[b"did:example:component".as_slice(), service.id.as_slice()].concat()
+                        )
+                        || input::uri(&service.id)),
+                Error::<T>::InvalidDocument
+            );
+            ensure!(input::token(&service.type_), Error::<T>::InvalidDocument);
+            ensure!(service.encoded_size() <= 4096, Error::<T>::InvalidDocument);
             ensure!(
                 !service.service_endpoint.is_empty(),
                 Error::<T>::InvalidDocument
             );
-            if let Some(authorization) = service.authorization.as_ref() {
-                for key_ref in authorization.iter() {
-                    ensure!(!key_ref.is_empty(), Error::<T>::InvalidDocument);
+            if input::reserved(&service.type_) {
+                ensure!(
+                    input::protected(&service.type_),
+                    Error::<T>::InvalidDocument
+                );
+                for endpoint in &service.service_endpoint {
+                    ensure!(
+                        endpoint.len() <= 128 && input::https(endpoint),
+                        Error::<T>::InvalidDocument
+                    );
                 }
+                if let Some(authorization) = service.authorization.as_ref() {
+                    for key_ref in authorization {
+                        ensure!(input::token(key_ref), Error::<T>::InvalidDocument);
+                    }
+                }
+            } else if service.service_endpoint[0].starts_with(input::OVERLAY_PREFIX) {
+                ensure!(
+                    service.service_endpoint.len() == 1
+                        && service.authorization.is_none()
+                        && service.priority.is_none()
+                        && input::overlay(
+                            &service.service_endpoint[0],
+                            &service.id,
+                            &service.type_
+                        ),
+                    Error::<T>::InvalidDocument
+                );
+            } else {
+                // Existing extension records remain readable and can be upgraded to the v1 envelope.
+                for endpoint in &service.service_endpoint {
+                    ensure!(input::uri(endpoint), Error::<T>::InvalidDocument);
+                }
+                ensure!(
+                    service.authorization.is_none() && service.priority.is_none(),
+                    Error::<T>::InvalidDocument
+                );
             }
             Ok(())
         }
@@ -2171,6 +2513,7 @@ pub mod pallet {
                 doc.verification_method
                     .try_push(method)
                     .map_err(|_| Error::<T>::InvalidDocument)?;
+                Self::validate_document_structure(&checked.did, &doc)?;
                 rec.document = Some(doc);
                 Self::bump_document_version(rec);
                 Ok(())
@@ -2195,6 +2538,7 @@ pub mod pallet {
                     .position(|existing| existing.id.as_slice() == method_id.as_slice())
                     .ok_or(Error::<T>::VerificationMethodNotFound)?;
                 doc.verification_method[pos] = method;
+                Self::validate_document_structure(&checked.did, &doc)?;
                 rec.document = Some(doc);
                 Self::bump_document_version(rec);
                 Ok(())
@@ -2223,6 +2567,7 @@ pub mod pallet {
                     .position(|existing| existing.id.as_slice() == method_id.as_slice())
                     .ok_or(Error::<T>::VerificationMethodNotFound)?;
                 doc.verification_method.remove(pos);
+                Self::validate_document_structure(&checked.did, &doc)?;
                 rec.document = Some(doc);
                 Self::bump_document_version(rec);
                 Ok(())
@@ -2253,6 +2598,7 @@ pub mod pallet {
                 auth.try_push(method_id.clone())
                     .map_err(|_| Error::<T>::InvalidDocument)?;
                 doc.authentication = Some(auth);
+                Self::validate_document_structure(&checked.did, &doc)?;
                 rec.document = Some(doc);
                 Self::bump_document_version(rec);
                 Ok(())
@@ -2279,6 +2625,7 @@ pub mod pallet {
                     .ok_or(Error::<T>::AuthenticationNotFound)?;
                 auth.remove(pos);
                 doc.authentication = if auth.is_empty() { None } else { Some(auth) };
+                Self::validate_document_structure(&checked.did, &doc)?;
                 rec.document = Some(doc);
                 Self::bump_document_version(rec);
                 Ok(())
@@ -2309,6 +2656,7 @@ pub mod pallet {
                 doc.key_agreement
                     .try_push(key_agreement)
                     .map_err(|_| Error::<T>::InvalidDocument)?;
+                Self::validate_document_structure(&checked.did, &doc)?;
                 rec.document = Some(doc);
                 Self::bump_document_version(rec);
                 Ok(())
@@ -2333,6 +2681,7 @@ pub mod pallet {
                     .position(|existing| existing.id.as_slice() == key_id.as_slice())
                     .ok_or(Error::<T>::KeyAgreementNotFound)?;
                 doc.key_agreement[pos] = key_agreement;
+                Self::validate_document_structure(&checked.did, &doc)?;
                 rec.document = Some(doc);
                 Self::bump_document_version(rec);
                 Ok(())
@@ -2355,6 +2704,7 @@ pub mod pallet {
                     .position(|existing| existing.id.as_slice() == key_id.as_slice())
                     .ok_or(Error::<T>::KeyAgreementNotFound)?;
                 doc.key_agreement.remove(pos);
+                Self::validate_document_structure(&checked.did, &doc)?;
                 rec.document = Some(doc);
                 Self::bump_document_version(rec);
                 Ok(())
@@ -2387,6 +2737,7 @@ pub mod pallet {
                     .try_push(service)
                     .map_err(|_| Error::<T>::ServiceTooLong)?;
                 doc.service = Some(services);
+                Self::validate_document_structure(&checked.did, &doc)?;
                 rec.document = Some(doc);
                 Self::bump_document_version(rec);
                 Ok(())
@@ -2412,6 +2763,7 @@ pub mod pallet {
                     .ok_or(Error::<T>::ServiceNotFound)?;
                 services[pos] = service;
                 doc.service = Some(services);
+                Self::validate_document_structure(&checked.did, &doc)?;
                 rec.document = Some(doc);
                 Self::bump_document_version(rec);
                 Ok(())
@@ -2439,6 +2791,7 @@ pub mod pallet {
                 } else {
                     Some(services)
                 };
+                Self::validate_document_structure(&checked.did, &doc)?;
                 rec.document = Some(doc);
                 Self::bump_document_version(rec);
                 Ok(())
@@ -2531,6 +2884,10 @@ pub mod pallet {
         fn decode_control_payload(
             signed_payload: &[u8],
         ) -> Result<ControlAuthorizationPayload<T>, Error<T>> {
+            ensure!(
+                signed_payload.len() <= 9_000,
+                Error::<T>::InvalidControlPayload
+            );
             let mut bytes = signed_payload;
             let payload = ControlAuthorizationPayload::<T>::decode(&mut bytes)
                 .map_err(|_| Error::<T>::InvalidControlPayload)?;
@@ -2561,7 +2918,7 @@ pub mod pallet {
             let rec = Dids::<T>::get(&payload.did).ok_or(Error::<T>::DidNotFound)?;
             Self::ensure_did_active(&rec)?;
             ensure!(
-                payload.nonce == ControlNonces::<T>::get(&payload.did),
+                payload.nonce == ControlNonces::<T>::get(&payload.did) && payload.nonce < u64::MAX,
                 Error::<T>::InvalidControlNonce
             );
             ensure!(
@@ -2574,6 +2931,14 @@ pub mod pallet {
                 ),
                 Error::<T>::InvalidSignature
             );
+            if let ControlAction::SetDeviceKeyAgreement {
+                key_agreement_override: Some(keys),
+                ..
+            } = &payload.action
+            {
+                Self::validate_device_keys(&payload.did, keys)
+                    .map_err(|_| Error::<T>::InvalidDeviceKeyAgreement)?;
+            }
             Ok(CheckedControlAuthorization {
                 did: payload.did,
                 action: payload.action,
@@ -2586,76 +2951,18 @@ pub mod pallet {
             let deletes_did = matches!(&checked.action, ControlAction::DeleteDid);
             match checked.action {
                 ControlAction::AddDevice { device_id } => {
-                    Dids::<T>::try_mutate(&did, |maybe| -> DispatchResult {
-                        let rec = maybe.as_mut().ok_or(Error::<T>::DidNotFound)?;
-                        Self::ensure_did_active(rec)?;
-                        let mut devices = rec.devices.take().unwrap_or_default();
-                        if let Some(existing) = devices
-                            .iter_mut()
-                            .find(|device| device.device_id == device_id)
-                        {
-                            existing.tombstoned = false;
-                        } else {
-                            devices
-                                .try_push(DeviceInfo {
-                                    device_id: device_id.clone(),
-                                    added_at: now_millis::<T>(),
-                                    tombstoned: false,
-                                })
-                                .map_err(|_| Error::<T>::TooManyDevices)?;
-                        }
-                        rec.devices = Some(devices);
-                        rec.version = rec.version.saturating_add(1);
-                        rec.updated_at = now_millis::<T>();
-                        Ok(())
-                    })?;
+                    Self::register_device(&did, &device_id)?;
                     Self::deposit_event(Event::DeviceAdded(did.clone(), device_id));
                 }
                 ControlAction::TombstoneDevice { device_id } => {
-                    Dids::<T>::try_mutate(&did, |maybe| -> DispatchResult {
-                        let rec = maybe.as_mut().ok_or(Error::<T>::DidNotFound)?;
-                        Self::ensure_did_active(rec)?;
-                        let mut devices = rec.devices.take().ok_or(Error::<T>::DeviceNotFound)?;
-                        let device = devices
-                            .iter_mut()
-                            .find(|device| device.device_id == device_id)
-                            .ok_or(Error::<T>::DeviceNotFound)?;
-                        device.tombstoned = true;
-                        rec.devices = Some(devices);
-                        rec.version = rec.version.saturating_add(1);
-                        rec.updated_at = now_millis::<T>();
-                        Ok(())
-                    })?;
+                    Self::tombstone_device_record(&did, &device_id)?;
                     Self::deposit_event(Event::DeviceTombstoned(did.clone(), device_id));
                 }
                 ControlAction::UpdateDevice {
                     old_device_id,
                     new_device_id,
                 } => {
-                    ensure!(
-                        old_device_id != new_device_id,
-                        Error::<T>::DeviceAlreadyExists
-                    );
-                    Dids::<T>::try_mutate(&did, |maybe| -> DispatchResult {
-                        let rec = maybe.as_mut().ok_or(Error::<T>::DidNotFound)?;
-                        Self::ensure_did_active(rec)?;
-                        let mut devices = rec.devices.take().ok_or(Error::<T>::DeviceNotFound)?;
-                        ensure!(
-                            !devices
-                                .iter()
-                                .any(|device| device.device_id == new_device_id),
-                            Error::<T>::DeviceAlreadyExists
-                        );
-                        let device = devices
-                            .iter_mut()
-                            .find(|device| device.device_id == old_device_id)
-                            .ok_or(Error::<T>::DeviceNotFound)?;
-                        device.device_id = new_device_id.clone();
-                        rec.devices = Some(devices);
-                        rec.version = rec.version.saturating_add(1);
-                        rec.updated_at = now_millis::<T>();
-                        Ok(())
-                    })?;
+                    Self::rename_device(&did, &old_device_id, &new_device_id)?;
                     Self::deposit_event(Event::DeviceUpdated(
                         did.clone(),
                         old_device_id,
@@ -2663,25 +2970,28 @@ pub mod pallet {
                     ));
                 }
                 ControlAction::RemoveDevice { device_id } => {
-                    Dids::<T>::try_mutate(&did, |maybe| -> DispatchResult {
-                        let rec = maybe.as_mut().ok_or(Error::<T>::DidNotFound)?;
-                        Self::ensure_did_active(rec)?;
-                        let mut devices = rec.devices.take().ok_or(Error::<T>::DeviceNotFound)?;
-                        let position = devices
-                            .iter()
-                            .position(|device| device.device_id == device_id)
-                            .ok_or(Error::<T>::DeviceNotFound)?;
-                        devices.remove(position);
-                        rec.devices = if devices.is_empty() {
-                            None
-                        } else {
-                            Some(devices)
-                        };
-                        rec.version = rec.version.saturating_add(1);
-                        rec.updated_at = now_millis::<T>();
+                    Self::remove_device_record(&did, &device_id)?;
+                    Self::deposit_event(Event::DeviceRemoved(did.clone(), device_id));
+                }
+                ControlAction::SetDeviceKeyAgreement {
+                    device_id,
+                    key_agreement_override,
+                } => {
+                    if let Some(keys) = &key_agreement_override {
+                        Self::validate_device_keys(&did, keys)?;
+                    }
+                    Self::migrate_devices(&did)?;
+                    Devices::<T>::try_mutate(&did, &device_id, |record| -> DispatchResult {
+                        let device = record.as_mut().ok_or(Error::<T>::DeviceNotFound)?;
+                        ensure!(!device.info.tombstoned, Error::<T>::DeviceNotFound);
+                        device.revision = device
+                            .revision
+                            .checked_add(1)
+                            .ok_or(Error::<T>::DeviceRevisionOverflow)?;
+                        device.key_agreement_override = key_agreement_override;
                         Ok(())
                     })?;
-                    Self::deposit_event(Event::DeviceRemoved(did.clone(), device_id));
+                    Self::deposit_event(Event::DeviceKeyAgreementSet(did.clone(), device_id));
                 }
                 ControlAction::DeactivateDid => {
                     ensure!(
@@ -2725,6 +3035,7 @@ pub mod pallet {
                         T::RetirementGuard::can_retire(did.as_slice()),
                         Error::<T>::DidControlsApplication
                     );
+                    PendingDeviceCleanup::<T>::insert(&did, ());
                     let record = Dids::<T>::take(&did).ok_or(Error::<T>::DidNotFound)?;
                     for alias in record.aliases.unwrap_or_default() {
                         AliasIndex::<T>::remove(alias);
@@ -2760,13 +3071,25 @@ pub mod pallet {
                 Error::<T>::InvalidSignature
             );
             let did_b = Self::validated_registration_did(did.clone())?;
+            ensure!(
+                !PendingDeviceCleanup::<T>::contains_key(&did_b),
+                Error::<T>::DeviceCleanupPending
+            );
 
             ensure!(
                 !Dids::<T>::contains_key(&did_b),
                 Error::<T>::DidAlreadyExists
             );
             ensure!(
-                verify_did_signature(&did, &timestamp, &pubkey, &signature),
+                input::proof_nonce(&timestamp, now_millis::<T>()) == Some(0)
+                    && verify_registration(
+                        &did,
+                        alias.as_deref(),
+                        &timestamp,
+                        &pubkey,
+                        &signature,
+                        doc_blob.as_deref().unwrap_or(&[])
+                    ),
                 Error::<T>::InvalidSignature
             );
             //print("do_register: after signature verify");
@@ -2783,6 +3106,10 @@ pub mod pallet {
                 let doc = DidDocument::<T>::decode(&mut bytes)
                     .map_err(|_| Error::<T>::InvalidDocument)?;
                 //print("do_register: document created, comparing did");
+                ensure!(
+                    bytes.is_empty() && doc.encode().as_slice() == bounded.as_slice(),
+                    Error::<T>::InvalidDocument
+                );
                 Self::validate_document_structure(&did_b, &doc)?;
                 doc_decoded = Some(doc);
             }
@@ -2837,7 +3164,7 @@ pub mod pallet {
 
     impl<T: Config> pallet_delivery_policy::DidProvider<T::AccountId> for Pallet<T> {
         fn did_exists(did: &[u8]) -> bool {
-            let Ok(did) = DidOf::<T>::try_from(did.to_vec()) else {
+            let Some(did) = Self::did_from_slice(did) else {
                 return false;
             };
             Dids::<T>::get(&did)
@@ -2855,7 +3182,7 @@ pub mod pallet {
             signed_payload: &[u8],
             signature: &[u8],
         ) -> bool {
-            let Ok(did_b) = DidOf::<T>::try_from(did.to_vec()) else {
+            let Some(did_b) = Self::did_from_slice(did) else {
                 return false;
             };
             let Ok(signer_key_id_b) = IdStrOf::<T>::try_from(signer_key_id.to_vec()) else {
@@ -2879,7 +3206,7 @@ pub mod pallet {
             service_id: &[u8],
             kind: pallet_delivery_policy::DeliveryServiceKind,
         ) -> bool {
-            let Ok(did) = DidOf::<T>::try_from(did.to_vec()) else {
+            let Some(did) = Self::did_from_slice(did) else {
                 return false;
             };
             let expected_type: &[u8] = match kind {
@@ -2906,19 +3233,18 @@ pub mod pallet {
         }
     }
 
-    fn verify_did_signature(did: &[u8], timestamp: &[u8], pubkey: &[u8], signature: &[u8]) -> bool {
-        let mut payload = Vec::new();
-        payload.extend_from_slice(did);
-        payload.push(b'|');
-        payload.extend_from_slice(timestamp);
-
-        let sig_result = ed25519::Signature::from_slice(signature);
-        let pk_result = ed25519::Public::from_slice(pubkey);
-
-        match (sig_result, pk_result) {
-            (Ok(sig), Ok(pk)) => ed25519_verify(&sig, &payload, &pk),
-            _ => false,
-        }
+    fn verify_registration(
+        did: &[u8],
+        alias: Option<&[u8]>,
+        timestamp: &[u8],
+        pubkey: &[u8],
+        signature: &[u8],
+        document: &[u8],
+    ) -> bool {
+        let payload = registration_payload(did, alias, pubkey, document, timestamp);
+        ed25519::Signature::from_slice(signature)
+            .and_then(|sig| ed25519::Public::from_slice(pubkey).map(|pk| (sig, pk)))
+            .is_ok_and(|(sig, pk)| ed25519_verify(&sig, &payload, &pk))
     }
 
     fn now_millis<T: Config>() -> u64 {
@@ -2940,7 +3266,7 @@ pub mod pallet {
         }
     }
 
-    fn decode_base58btc(input: &[u8]) -> Option<Vec<u8>> {
+    pub(crate) fn decode_base58btc(input: &[u8]) -> Option<Vec<u8>> {
         let mut decoded = Vec::<u8>::new();
         for char in input {
             let mut carry = base58btc_value(*char)? as u32;
@@ -2985,40 +3311,123 @@ pub mod pallet {
                 return false;
             }
 
-            let remainder = &did[DID_PREFIX.len()..];
-            let Some(separator) = remainder.iter().position(|byte| *byte == b':') else {
-                return false;
-            };
-            let platform = &remainder[..separator];
-            let address = &remainder[separator + 1..];
-
-            if address.contains(&b':')
-                || !(MIN_DID_PLATFORM_LEN..=MAX_DID_PLATFORM_LEN).contains(&platform.len())
-                || !(MIN_DID_ADDRESS_LEN..=MAX_DID_ADDRESS_LEN).contains(&address.len())
+            let address = &did[DID_PREFIX.len()..];
+            if !(MIN_DID_ADDRESS_LEN..=MAX_DID_ADDRESS_LEN).contains(&address.len())
             {
                 return false;
             }
 
-            platform
-                .iter()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
-                && address.iter().all(|byte| base58btc_value(*byte).is_some())
+            address.iter().all(|byte| base58btc_value(*byte).is_some())
         }
 
         pub(crate) fn authorize_unsigned_call(call: &Call<T>) -> TransactionValidityWithRefund {
             Self::validate_unsigned_call(call).map(|validity| (validity, Weight::zero()))
         }
 
+        fn valid_lifecycle_proof(
+            did: &[u8],
+            alias: Option<&[u8]>,
+            timestamp: &[u8],
+            pubkey: &[u8],
+            signature: &[u8],
+            blob: Option<&[u8]>,
+            replacement: bool,
+        ) -> bool {
+            if !Self::is_canonical_did(did) {
+                return false;
+            }
+            let Ok(did_b) = DidOf::<T>::try_from(did.to_vec()) else {
+                return false;
+            };
+            let Some(nonce) = input::proof_nonce(timestamp, now_millis::<T>()) else {
+                return false;
+            };
+            if nonce == u64::MAX
+                || Self::bounded_root_pubkey(pubkey.to_vec()).is_err()
+                || signature.len() != 64
+            {
+                return false;
+            }
+            if let Some(bytes) = blob {
+                if bytes.len() > T::MaxDocLen::get() as usize {
+                    return false;
+                }
+                let mut input_bytes = bytes;
+                let Ok(doc) = DidDocument::<T>::decode(&mut input_bytes) else {
+                    return false;
+                };
+                if !input_bytes.is_empty()
+                    || doc.encode().as_slice() != bytes
+                    || Self::validate_document_structure(&did_b, &doc).is_err()
+                {
+                    return false;
+                }
+            }
+            if replacement {
+                let Some(rec) = Dids::<T>::get(&did_b) else {
+                    return false;
+                };
+                if rec.deactivated
+                    || nonce != DocumentNonces::<T>::get(&did_b)
+                    || rec.root_pubkey.as_ref().map(|k| k.as_slice()) != Some(pubkey)
+                {
+                    return false;
+                }
+                let Some(blob) = blob else {
+                    return false;
+                };
+                let payload = [
+                    b"openpayload:set_document:v2|".as_slice(),
+                    did,
+                    b"|",
+                    &sp_io::hashing::blake2_256(blob),
+                    b"|",
+                    timestamp,
+                ]
+                .concat();
+                ed25519::Signature::from_slice(signature)
+                    .and_then(|sig| ed25519::Public::from_slice(pubkey).map(|pk| (sig, pk)))
+                    .is_ok_and(|(sig, pk)| ed25519_verify(&sig, &payload, &pk))
+            } else {
+                nonce == 0
+                    && Self::is_canonical_did(did)
+                    && !Dids::<T>::contains_key(&did_b)
+                    && alias.is_none_or(|a| Self::normalize_alias(a).is_ok())
+                    && verify_registration(
+                        did,
+                        alias,
+                        timestamp,
+                        pubkey,
+                        signature,
+                        blob.unwrap_or(&[]),
+                    )
+            }
+        }
+
         pub(crate) fn validate_unsigned_call(call: &Call<T>) -> TransactionValidity {
             match call {
-                Call::register_with_proof { did, timestamp, .. } => {
-                    if !Self::is_canonical_did(did) {
+                Call::register_with_proof {
+                    did,
+                    alias,
+                    timestamp,
+                    pubkey,
+                    signature,
+                } => {
+                    if !Self::valid_lifecycle_proof(
+                        did,
+                        alias.as_deref(),
+                        timestamp,
+                        pubkey,
+                        signature,
+                        None,
+                        false,
+                    ) {
                         return InvalidTransaction::BadProof.into();
                     }
 
                     ValidTransaction::with_tag_prefix("OpenPayloadRegister")
                         .priority(1000) // Higher = more likely to be included
-                        .and_provides((did.clone(), timestamp.clone())) // prevents replay
+                        .and_provides(did.clone()) // one pending registration per DID
                         .longevity(64) // how long this tx is valid (in blocks)
                         .propagate(true)
                         .build()
@@ -3027,18 +3436,30 @@ pub mod pallet {
                     did,
                     timestamp,
                     doc_blob,
-                    ..
+                    pubkey,
+                    signature,
                 } => {
-                    if did.is_empty() || did.len() > T::MaxDidLen::get() as usize {
+                    if !Self::valid_lifecycle_proof(
+                        did,
+                        None,
+                        timestamp,
+                        pubkey,
+                        signature,
+                        Some(doc_blob),
+                        true,
+                    ) {
                         return InvalidTransaction::BadProof.into();
                     }
                     // small DoS guard: reject absurd docs early in the pool if you want
                     if doc_blob.len() as u32 > T::MaxDocLen::get() {
                         return InvalidTransaction::ExhaustsResources.into();
                     }
-                    ValidTransaction::with_tag_prefix("OpenPayload")
+                    ValidTransaction::with_tag_prefix("OpenPayloadDocument")
                         .priority(900)
-                        .and_provides((b"setdoc", did.clone(), timestamp.clone()))
+                        .and_provides((
+                            did.clone(),
+                            input::proof_nonce(timestamp, now_millis::<T>()).unwrap_or(u64::MAX),
+                        ))
                         .longevity(64)
                         .propagate(true)
                         .build()
@@ -3047,18 +3468,27 @@ pub mod pallet {
                     did,
                     timestamp,
                     doc_blob,
-                    ..
+                    alias,
+                    pubkey,
+                    signature,
                 } => {
-                    if !Self::is_canonical_did(did) {
+                    if !Self::valid_lifecycle_proof(
+                        did,
+                        alias.as_deref(),
+                        timestamp,
+                        pubkey,
+                        signature,
+                        Some(doc_blob),
+                        false,
+                    ) {
                         return InvalidTransaction::BadProof.into();
                     }
                     if (doc_blob.len() as u32) > T::MaxDocLen::get() {
                         return InvalidTransaction::ExhaustsResources.into();
                     }
-                    ValidTransaction::with_tag_prefix("OpenPayload")
+                    ValidTransaction::with_tag_prefix("OpenPayloadRegister")
                         .priority(1000)
-                        // prevent exact duplicate in mempool
-                        .and_provides((b"regdoc", did.clone(), timestamp.clone()))
+                        .and_provides(did.clone())
                         .longevity(64)
                         .propagate(true)
                         .build()
@@ -3432,7 +3862,7 @@ pub mod pallet {
 
             ValidTransaction::with_tag_prefix("OpenPayloadDocument")
                 .priority(940)
-                .and_provides((checked.did, checked.nonce, action))
+                .and_provides((checked.did, checked.nonce))
                 .longevity(64)
                 .propagate(true)
                 .build()

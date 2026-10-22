@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+frame-benchmarking = { workspace = true, optional = true }
+dnssec-prover = { path = "../../vendor/dnssec-prover", default-features = false, features = ["validation"] }
+sp-io = { workspace = true }
 codec = { workspace = true, features = ["derive"] }
 frame-support = { workspace = true }
 frame-system = { workspace = true }
@@ -14,12 +17,17 @@ sp-api = { workspace = true }
 sp-runtime = { workspace = true }
 
 [dev-dependencies]
+sp-core = { workspace = true, features = ["std"] }
+p256 = { version = "0.13.2", features = ["ecdsa"] }
 sp-io = { workspace = true, features = ["std"] }
 
 [features]
 default = ["std"]
 std = [
+	"frame-benchmarking?/std",
 	"codec/std",
+	"sp-io/std",
+	"dnssec-prover/std",
 	"frame-support/std",
 	"frame-system/std",
 	"pallet-timestamp/std",
@@ -34,3 +42,5 @@ try-runtime = [
 	"frame-system/try-runtime",
 	"sp-runtime/try-runtime",
 ]
+
+runtime-benchmarks = ["frame-benchmarking/runtime-benchmarks", "frame-support/runtime-benchmarks", "frame-system/runtime-benchmarks", "pallet-timestamp/runtime-benchmarks"]

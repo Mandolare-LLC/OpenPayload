@@ -2,6 +2,10 @@
 #![allow(clippy::too_many_arguments)]
 
 extern crate alloc;
+mod call_url;
+mod opaque;
+mod measured_weights;
+pub use opaque::*;
 
 use alloc::vec::Vec;
 use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
@@ -21,11 +25,16 @@ use sp_runtime::SaturatedConversion;
 pub use pallet::*;
 
 pub mod weights;
+pub mod dnssec;
 
 #[cfg(test)]
 mod mock;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod opaque_tests;
+#[cfg(feature = "runtime-benchmarks")]
+mod benchmarking;
 
 pub trait DidProvider<AccountId> {
     fn did_exists(did: &[u8]) -> bool;
@@ -53,11 +62,10 @@ pub trait DidProvider<AccountId> {
 /// control an active application. Returning None disables its policy.
 pub trait ApplicationProvider {
     fn active_control_did(application_id: &[u8]) -> Option<Vec<u8>>;
-    fn verified_domain(_application_id: &[u8]) -> Option<Vec<u8>> {
-        None
-    }
+    fn verified_domain(_application_id: &[u8]) -> Option<Vec<u8>> { None }
     fn authorized_send_target(application_id: &[u8], target: &[u8]) -> bool {
-        Self::active_control_did(application_id).is_some_and(|control| control.as_slice() == target)
+        Self::active_control_did(application_id)
+            .is_some_and(|control| control.as_slice() == target)
     }
 }
 
@@ -73,20 +81,6 @@ pub enum DeliveryServiceKind {
     Cache,
     Archive,
     ApplicationControl,
-}
-
-/// Verifies a directory/validator attestation that DNS ownership was checked
-/// off-chain. The runtime deliberately never performs DNS itself.
-pub trait PersonaAttestationProvider<AccountId> {
-    fn verify_attestation(attestor: &AccountId, payload: &[u8], signature: &[u8]) -> bool;
-}
-
-impl<AccountId> PersonaAttestationProvider<AccountId> for () {
-    fn verify_attestation(_attestor: &AccountId, payload: &[u8], signature: &[u8]) -> bool {
-        // Useful for pallet-only tests. Production runtimes must provide an
-        // implementation backed by an admitted validator/directory identity.
-        payload == signature
-    }
 }
 
 /// Clock-time and transport limits returned by the runtime API. All byte
@@ -150,9 +144,7 @@ pub enum DeliveryStepOperationView {
         payload_template: Vec<u8>,
     },
     Call {
-        service_did: Vec<u8>,
-        service_id: Vec<u8>,
-        registered_domain: Vec<u8>,
+        url: Vec<u8>,
         payload_template: Vec<u8>,
     },
     RequireProfile,
@@ -213,7 +205,9 @@ pub struct ResolvedDeliveryPolicyView {
 sp_api::decl_runtime_apis! {
     /// Deterministically resolves the winning policy at the queried block.
     /// Clients should call this against finalized state through `state_call`.
+    #[api_version(3)]
     pub trait DeliveryPolicyRuntimeApi {
+        fn verify_dnssec_txt(record_name: Vec<u8>, record_value: Vec<u8>, proof: Vec<u8>) -> Option<u64>;
         fn resolve_delivery_policy(
             recipient: Vec<u8>,
             persona: Option<Vec<u8>>,
@@ -246,11 +240,10 @@ pub mod pallet {
     use super::*;
     use crate::weights::WeightInfo as _;
 
-    const STORAGE_VERSION: StorageVersion = StorageVersion::new(5);
+    const STORAGE_VERSION: StorageVersion = StorageVersion::new(8);
     const MIGRATED_POLICY_TTL_SECONDS: u32 = 60;
     const UNBOUNDED_MESSAGE_BYTES_COMPAT: u32 = u32::MAX;
     const UNBOUNDED_CHUNKS_COMPAT: u16 = u16::MAX;
-    const PERSONA_ATTESTATION_DOMAIN: &[u8] = b"openpayload:persona:dns:v1";
 
     #[cfg(feature = "try-runtime")]
     #[derive(Encode, Decode, PartialEq, Eq)]
@@ -278,6 +271,7 @@ pub mod pallet {
     pub type TagOf<T> = BoundedVec<u8, <T as Config>::MaxTagLen>;
     pub type ApplicationIdOf = BoundedVec<u8, ConstU32<64>>;
     pub type PayloadTemplateOf = BoundedVec<u8, ConstU32<4096>>;
+    pub type CallUrlOf = BoundedVec<u8, ConstU32<4096>>;
     pub type ServiceRefOf<T> = BoundedVec<u8, <T as Config>::MaxServiceRefLen>;
     pub type ControllerKeysOf<T> = BoundedVec<SignerKeyId, <T as Config>::MaxPersonaControllerKeys>;
 
@@ -445,9 +439,7 @@ pub mod pallet {
             payload_template: PayloadTemplateOf,
         },
         Call {
-            service_did: DidOf<T>,
-            service_id: ServiceRefOf<T>,
-            registered_domain: PersonaOf<T>,
+            url: CallUrlOf,
             payload_template: PayloadTemplateOf,
         },
         /// Requires the public Persona release profile before route steps run.
@@ -759,31 +751,6 @@ pub mod pallet {
     #[codec(mel_bound())]
     #[codec(decode_bound())]
     #[codec(decode_with_mem_tracking_bound())]
-    pub struct PersonaAttestationPayload<T: Config> {
-        pub domain: BoundedVec<u8, ConstU32<64>>,
-        pub genesis_hash: T::Hash,
-        pub persona: PersonaOf<T>,
-        pub operator_did: DidOf<T>,
-        pub dns_proof_hash: [u8; 32],
-        pub challenge_nonce: u64,
-        pub verification_expires_at: u64,
-    }
-
-    #[derive(
-        Encode,
-        Decode,
-        DecodeWithMemTracking,
-        CloneNoBound,
-        PartialEqNoBound,
-        EqNoBound,
-        DebugNoBound,
-        TypeInfo,
-        MaxEncodedLen,
-    )]
-    #[scale_info(skip_type_params(T))]
-    #[codec(mel_bound())]
-    #[codec(decode_bound())]
-    #[codec(decode_with_mem_tracking_bound())]
     pub struct ResolvedDeliveryPolicy<T: Config> {
         pub source: PolicyScopeV2<T>,
         pub policy_id: PolicyIdOf<T>,
@@ -867,8 +834,8 @@ pub mod pallet {
             dns_proof_hash: [u8; 32],
             challenge_nonce: u64,
             verification_expires_at: u64,
-            attestor: T::AccountId,
-            attestation_signature: Vec<u8>,
+            challenge_expires_at: u64,
+            dnssec_proof: BoundedVec<u8, ConstU32<65536>>,
         },
         Renew {
             persona: PersonaOf<T>,
@@ -876,8 +843,8 @@ pub mod pallet {
             dns_proof_hash: [u8; 32],
             challenge_nonce: u64,
             verification_expires_at: u64,
-            attestor: T::AccountId,
-            attestation_signature: Vec<u8>,
+            challenge_expires_at: u64,
+            dnssec_proof: BoundedVec<u8, ConstU32<65536>>,
         },
         Revoke {
             persona: PersonaOf<T>,
@@ -896,8 +863,8 @@ pub mod pallet {
             dns_proof_hash: [u8; 32],
             challenge_nonce: u64,
             verification_expires_at: u64,
-            attestor: T::AccountId,
-            attestation_signature: Vec<u8>,
+            challenge_expires_at: u64,
+            dnssec_proof: BoundedVec<u8, ConstU32<65536>>,
             new_operator_signer_key_id: SignerKeyId,
             new_operator_signature: Vec<u8>,
         },
@@ -907,6 +874,15 @@ pub mod pallet {
             controller_threshold: u8,
             constraints: Option<RequestedDeliveryConstraints>,
         },
+        StartRecovery {
+            persona: PersonaOf<T>, recovery_id: [u8; 32],
+            controller_key_ids: ControllerKeysOf<T>, controller_threshold: u8,
+            preserve_policy: bool, proof: PersonaRecoveryProof,
+        },
+        ProveRecovery { persona: PersonaOf<T>, recovery_id: [u8; 32], proof: PersonaRecoveryProof },
+        CancelRecovery { persona: PersonaOf<T>, recovery_id: [u8; 32] },
+        FinalizeRecovery { persona: PersonaOf<T>, recovery_id: [u8; 32] },
+
     }
 
     #[derive(
@@ -929,6 +905,36 @@ pub mod pallet {
         pub nonce: u64,
         pub valid_until: u64,
         pub signer_key_id: SignerKeyId,
+    }
+
+
+    /// DNSSEC recovery evidence. Email observations by a Directory are not chain authority.
+    #[derive(Encode, Decode, DecodeWithMemTracking, Clone, PartialEq, Eq, Debug, TypeInfo)]
+    pub struct PersonaRecoveryProof {
+        pub factors: u8,
+        pub proof_hash: [u8; 32],
+        pub proof_valid_until: u64,
+        pub verification_expires_at: u64,
+        pub challenge_nonce: u64,
+        pub challenge_expires_at: u64,
+        pub dnssec_proof: BoundedVec<u8, ConstU32<65536>>,
+    }
+
+    #[derive(Encode, Decode, DecodeWithMemTracking, CloneNoBound, PartialEqNoBound,
+        EqNoBound, DebugNoBound, TypeInfo, MaxEncodedLen)]
+    #[scale_info(skip_type_params(T))]
+    pub struct PersonaRecoveryRecord<T: Config> {
+        pub operator_did: DidOf<T>,
+        pub controller_key_ids: ControllerKeysOf<T>,
+        pub controller_threshold: u8,
+        pub preserve_policy: bool,
+        pub started_at: u64,
+        pub expires_at: u64,
+        pub dns_valid_until: u64,
+        pub email_valid_until: u64,
+        pub verification_expires_at: u64,
+        pub proof_hash: [u8; 32],
+        pub cancelled: bool,
     }
 
     #[derive(
@@ -1053,9 +1059,12 @@ pub mod pallet {
             + MaxEncodedLen
             + TypeInfo;
         type DidProvider: DidProvider<Self::AccountId>;
+        #[cfg(feature = "runtime-benchmarks")]
+        type BenchmarkHelper: crate::opaque::BenchmarkHelper;
+        #[pallet::constant]
+        type MaxPolicyDocumentBytes: Get<u32>;
         type ApplicationProvider: ApplicationProvider;
-        type PersonaAttestationProvider: PersonaAttestationProvider<Self::AccountId>;
-        type PersonaAttestorOrigin: EnsureOrigin<Self::RuntimeOrigin>;
+        type DnssecTrustAnchorOrigin: EnsureOrigin<Self::RuntimeOrigin>;
         type WeightInfo: weights::WeightInfo;
 
         #[pallet::constant]
@@ -1162,13 +1171,37 @@ pub mod pallet {
     pub type PersonaOperatorNonces<T: Config> =
         StorageMap<_, Blake2_128Concat, DidOf<T>, u64, ValueQuery>;
 
-    /// Governance-admitted Directory/validator accounts permitted to attest
-    /// off-chain DNS validation. Admission and cryptographic verification are
-    /// independent checks.
+
+    /// At most eight pending requests per registered domain; each expires after 14 days.
+    #[pallet::storage]
+    pub type PersonaRecoveries<T: Config> = StorageDoubleMap<_, Blake2_128Concat,
+        PersonaOf<T>, Blake2_128Concat, [u8; 32], PersonaRecoveryRecord<T>, OptionQuery>;
+    #[pallet::storage]
+    pub type PersonaRecoveryIds<T: Config> = StorageMap<_, Blake2_128Concat,
+        PersonaOf<T>, BoundedVec<[u8; 32], ConstU32<8>>, ValueQuery>;
+
+    /// Obsolete attestor storage retained for compatibility. Never used as authority.
     #[pallet::storage]
     #[pallet::getter(fn persona_attestor)]
     pub type PersonaAttestors<T: Config> =
         StorageMap<_, Blake2_128Concat, T::AccountId, (), OptionQuery>;
+
+    #[derive(Encode, Decode, DecodeWithMemTracking, Clone, PartialEq, Eq, Debug, TypeInfo, MaxEncodedLen)]
+    pub struct DnssecRootTrustAnchor {
+        pub algorithm: u8,
+        pub digest: [u8; 32],
+        pub valid_from: u64,
+        pub valid_until: u64,
+    }
+
+    #[pallet::storage]
+    pub type DnssecRootTrustAnchors<T: Config> = StorageMap<_, Blake2_128Concat,
+        u16, DnssecRootTrustAnchor, OptionQuery>;
+
+    /// New prefix prevents recovery records admitted by obsolete attestors from being finalized.
+    #[pallet::storage]
+    pub type DnssecRecoveryIds<T: Config> = StorageDoubleMap<_, Blake2_128Concat,
+        PersonaOf<T>, Blake2_128Concat, [u8; 32], (), OptionQuery>;
 
     #[pallet::storage]
     #[pallet::getter(fn did_policy_v2)]
@@ -1190,6 +1223,14 @@ pub mod pallet {
 
     #[pallet::storage]
     pub type PolicyV3Nonces<T: Config> = StorageMap<_, Blake2_128Concat, DidOf<T>, u64, ValueQuery>;
+
+    /// Authoritative opaque records; an empty document is a retained clear mask.
+    #[pallet::storage]
+    pub type PoliciesV4<T: Config> = StorageMap<_, Blake2_128Concat, PolicyScopeV3<T>, PolicyDocumentRecord<T>, OptionQuery>;
+
+    /// Independent, durable owner nonce namespace for raw policy publication.
+    #[pallet::storage]
+    pub type PolicyV4Nonces<T: Config> = StorageMap<_, Blake2_128Concat, DidOf<T>, u64, ValueQuery>;
 
     #[pallet::event]
     #[pallet::generate_deposit(pub(super) fn deposit_event)]
@@ -1226,6 +1267,11 @@ pub mod pallet {
             new_operator_did: DidOf<T>,
             revision: u64,
         },
+        PersonaRecoveryStarted { persona: PersonaOf<T>, recovery_id: [u8; 32], operator_did: DidOf<T> },
+        PersonaRecoveryUpdated { persona: PersonaOf<T>, recovery_id: [u8; 32] },
+        PersonaRecoveryCancelled { persona: PersonaOf<T>, recovery_id: [u8; 32] },
+        PersonaRecovered { persona: PersonaOf<T>, operator_did: DidOf<T>, preserve_policy: bool },
+        DnssecRootTrustAnchorUpdated { key_tag: u16, removed: bool },
         PersonaAttestorUpdated {
             attestor: T::AccountId,
             approved: bool,
@@ -1246,6 +1292,7 @@ pub mod pallet {
         PolicyV3Cleared {
             scope: PolicyScopeV3<T>,
         },
+        PolicyDocumentChanged { scope: PolicyScopeV3<T>, revision: u64, content_hash: [u8;32], cleared: bool },
     }
 
     #[pallet::error]
@@ -1298,6 +1345,26 @@ pub mod pallet {
         InvalidPayloadTemplate,
         InvalidPolicyV3Payload,
         InvalidPolicyV3Nonce,
+        RecoveryNotFound,
+        RecoveryExpired,
+        RecoveryNotReady,
+        RecoveryAlreadyExists,
+        TooManyRecoveries,
+        InvalidRecoveryProof,
+        DnssecRequired,
+        InvalidDnssecProof,
+        InvalidDnssecTrustAnchor,
+        TooManyDnssecTrustAnchors,
+        LegacyPolicyWriteDisabled,
+        InvalidPolicyDocumentProof,
+        PolicyDocumentWrongChain,
+        PolicyDocumentAuthorizationExpired,
+        InvalidPolicyDocumentNonce,
+        PolicyDocumentNonceOverflow,
+        InvalidPolicyDocumentRevision,
+        PolicyDocumentRevisionOverflow,
+        EmptyPolicyDocument,
+
     }
 
     #[pallet::hooks]
@@ -1329,7 +1396,7 @@ pub mod pallet {
                     })
                 });
             }
-            if on_chain < STORAGE_VERSION {
+            if on_chain < StorageVersion::new(5) {
                 for (did, old) in DidPoliciesV2::<T>::iter() {
                     let scope = PolicyScopeV3::Did(did);
                     if let Ok(policy_id) = Self::expected_policy_id_v3(&scope) {
@@ -1368,6 +1435,10 @@ pub mod pallet {
                 return T::DbWeight::get()
                     .reads_writes(migrated.saturating_mul(2) + 1, migrated + 1);
             }
+            if on_chain < STORAGE_VERSION {
+                STORAGE_VERSION.put::<Pallet<T>>();
+                return T::DbWeight::get().reads_writes(1, 1);
+            }
             T::DbWeight::get().reads(1)
         }
 
@@ -1377,8 +1448,14 @@ pub mod pallet {
                 Pallet::<T>::on_chain_storage_version() <= STORAGE_VERSION,
                 "delivery-policy on-chain storage version is newer than this runtime"
             );
+            if Pallet::<T>::on_chain_storage_version() == StorageVersion::new(6) {
+                ensure!(DidPoliciesV2::<T>::iter_keys().next().is_none()
+                    && PersonaPoliciesV2::<T>::iter_keys().next().is_none()
+                    && PoliciesV3::<T>::iter_keys().next().is_none(),
+                    "direct URL Call upgrade requires empty V2/V3 policy maps");
+            }
             Ok((
-                (Pallet::<T>::on_chain_storage_version() < STORAGE_VERSION),
+                (Pallet::<T>::on_chain_storage_version() < StorageVersion::new(5)),
                 Self::migration_snapshot(),
             )
                 .encode())
@@ -1436,17 +1513,8 @@ pub mod pallet {
         #[pallet::call_index(1)]
         #[pallet::weight(T::DbWeight::get().reads_writes(2, 1))]
         pub fn clear_delivery_policy(origin: OriginFor<T>, did: Vec<u8>) -> DispatchResult {
-            let did = Self::ensure_policy_controller(origin, did)?;
-            ensure!(
-                RecipientPolicies::<T>::contains_key(&did),
-                Error::<T>::PolicyNotFound
-            );
-            RecipientPolicies::<T>::remove(&did);
-            Self::deposit_event(Event::PolicyCleared {
-                scope: PolicyScope::Recipient,
-                did,
-            });
-            Ok(())
+            let _ = (origin, did);
+            Err(Error::<T>::LegacyPolicyWriteDisabled.into())
         }
 
         #[pallet::call_index(2)]
@@ -1457,7 +1525,7 @@ pub mod pallet {
             policy: DeliveryPolicy<T>,
         ) -> DispatchResult {
             let _ = (origin, tag_did, policy);
-            Err(Error::<T>::LegacyPolicyDeprecated.into())
+            Err(Error::<T>::LegacyPolicyWriteDisabled.into())
         }
 
         #[pallet::call_index(3)]
@@ -1471,9 +1539,7 @@ pub mod pallet {
             Err(Error::<T>::LegacyPolicyDeprecated.into())
         }
 
-        /// Apply a delivery-policy action using a DID root/authorized-key
-        /// proof. Account-controller calls remain available above for direct
-        /// chain integrations.
+        /// Retired typed-policy call; its wire index remains reserved for compatibility.
         #[pallet::call_index(4)]
         #[pallet::weight(T::DbWeight::get().reads_writes(3,1))]
         #[pallet::authorize(|_source, signed_payload, signature, signer_key_id| {
@@ -1490,37 +1556,8 @@ pub mod pallet {
             signature: Vec<u8>,
             signer_key_id: Vec<u8>,
         ) -> DispatchResult {
-            Self::ensure_unsigned_or_authorized(origin)?;
-            let payload =
-                Self::validate_policy_authorization(&signed_payload, &signature, &signer_key_id)?;
-            let did = payload.did.clone();
-            match payload.action {
-                PolicyAction::SetRecipient(policy) => {
-                    let _ = policy;
-                    return Err(Error::<T>::LegacyPolicyDeprecated.into());
-                }
-                PolicyAction::ClearRecipient => {
-                    ensure!(
-                        RecipientPolicies::<T>::contains_key(&did),
-                        Error::<T>::PolicyNotFound
-                    );
-                    RecipientPolicies::<T>::remove(&did);
-                    Self::deposit_event(Event::PolicyCleared {
-                        scope: PolicyScope::Recipient,
-                        did: did.clone(),
-                    });
-                }
-                PolicyAction::SetTag(policy) => {
-                    let _ = policy;
-                    return Err(Error::<T>::LegacyPolicyDeprecated.into());
-                }
-                PolicyAction::SetPersona(policy) => {
-                    let _ = policy;
-                    return Err(Error::<T>::LegacyPolicyDeprecated.into());
-                }
-            }
-            PolicyNonces::<T>::insert(&did, payload.nonce.saturating_add(1));
-            Ok(())
+            let _ = (origin, signed_payload, signature, signer_key_id);
+            Err(Error::<T>::LegacyPolicyWriteDisabled.into())
         }
 
         /// Set DID-level clock-time and transport limits. The stored effective
@@ -1541,8 +1578,7 @@ pub mod pallet {
         }
 
         /// Register a globally unique, DNS-backed Persona. DNS is resolved by
-        /// an admitted directory/validator and its canonical attestation is
-        /// verified here; the runtime never attempts network I/O.
+        /// any Directory; its DNSSEC evidence is verified here offline.
         #[pallet::call_index(6)]
         #[pallet::weight(<T as Config>::WeightInfo::register_persona())]
         #[allow(clippy::too_many_arguments)]
@@ -1556,8 +1592,8 @@ pub mod pallet {
             dns_proof_hash: [u8; 32],
             challenge_nonce: u64,
             verification_expires_at: u64,
-            attestor: T::AccountId,
-            attestation_signature: Vec<u8>,
+            challenge_expires_at: u64,
+            dnssec_proof: BoundedVec<u8, ConstU32<65536>>,
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
             let persona = Self::canonical_persona(&persona)?;
@@ -1580,14 +1616,15 @@ pub mod pallet {
                 .as_ref()
                 .map(Self::validated_constraints)
                 .transpose()?;
-            Self::verify_persona_attestation(
+            Self::verify_persona_dnssec(
                 &persona,
                 &operator_did,
                 dns_proof_hash,
                 challenge_nonce,
                 verification_expires_at,
-                &attestor,
-                &attestation_signature,
+                challenge_expires_at,
+                &dnssec_proof,
+                b"register_persona", &[0; 32],
             )?;
             let now = pallet_timestamp::Pallet::<T>::get().saturated_into::<u64>();
             Personas::<T>::insert(
@@ -1622,28 +1659,27 @@ pub mod pallet {
             dns_proof_hash: [u8; 32],
             challenge_nonce: u64,
             verification_expires_at: u64,
-            attestor: T::AccountId,
-            attestation_signature: Vec<u8>,
+            challenge_expires_at: u64,
+            dnssec_proof: BoundedVec<u8, ConstU32<65536>>,
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
             let persona = Self::canonical_persona(&persona)?;
-            ensure!(
-                !NonDnsPersonas::<T>::contains_key(&persona),
-                Error::<T>::InvalidPersona
-            );
+            ensure!(!NonDnsPersonas::<T>::contains_key(&persona),
+                Error::<T>::InvalidPersona);
             let mut record = Personas::<T>::get(&persona).ok_or(Error::<T>::PersonaNotFound)?;
             ensure!(
                 T::DidProvider::can_update_policy(&who, record.operator_did.as_slice()),
                 Error::<T>::NotPolicyController
             );
-            Self::verify_persona_attestation(
+            Self::verify_persona_dnssec(
                 &persona,
                 &record.operator_did,
                 dns_proof_hash,
                 challenge_nonce,
                 verification_expires_at,
-                &attestor,
-                &attestation_signature,
+                challenge_expires_at,
+                &dnssec_proof,
+                b"renew_persona", &[0; 32],
             )?;
             if let Some(constraints) = constraints.as_ref() {
                 record.delivery_constraints = Some(Self::validated_constraints(constraints)?);
@@ -1687,29 +1723,15 @@ pub mod pallet {
             did: Vec<u8>,
             policy: DeliveryPolicyV2<T>,
         ) -> DispatchResult {
-            let did = Self::ensure_policy_controller(origin, did)?;
-            ensure!(policy.operator_did == did, Error::<T>::InvalidPolicyScope);
-            ensure!(
-                policy.scope == PolicyScopeV2::Did(did.clone()),
-                Error::<T>::InvalidPolicyScope
-            );
-            Self::store_policy_v2(policy)
+            let _ = (origin, did, policy);
+            Err(Error::<T>::LegacyPolicyWriteDisabled.into())
         }
 
         #[pallet::call_index(10)]
         #[pallet::weight(<T as Config>::WeightInfo::clear_did_policy_v2())]
         pub fn clear_did_policy_v2(origin: OriginFor<T>, did: Vec<u8>) -> DispatchResult {
-            let did = Self::ensure_policy_controller(origin, did)?;
-            ensure!(
-                DidPoliciesV2::<T>::contains_key(&did),
-                Error::<T>::PolicyNotFound
-            );
-            DidPoliciesV2::<T>::remove(&did);
-            PoliciesV3::<T>::remove(PolicyScopeV3::Did(did.clone()));
-            Self::deposit_event(Event::PolicyV2Cleared {
-                scope: PolicyScopeV2::Did(did),
-            });
-            Ok(())
+            let _ = (origin, did);
+            Err(Error::<T>::LegacyPolicyWriteDisabled.into())
         }
 
         #[pallet::call_index(11)]
@@ -1719,41 +1741,15 @@ pub mod pallet {
             persona: Vec<u8>,
             policy: DeliveryPolicyV2<T>,
         ) -> DispatchResult {
-            let who = ensure_signed(origin)?;
-            let persona = Self::canonical_persona(&persona)?;
-            let record = Self::active_persona(&persona)?;
-            ensure!(
-                T::DidProvider::can_update_policy(&who, record.operator_did.as_slice()),
-                Error::<T>::NotPolicyController
-            );
-            ensure!(
-                policy.operator_did == record.operator_did
-                    && policy.scope == PolicyScopeV2::Persona(persona),
-                Error::<T>::InvalidPolicyScope
-            );
-            Self::store_policy_v2(policy)
+            let _ = (origin, persona, policy);
+            Err(Error::<T>::LegacyPolicyWriteDisabled.into())
         }
 
         #[pallet::call_index(12)]
         #[pallet::weight(<T as Config>::WeightInfo::clear_persona_policy_v2())]
         pub fn clear_persona_policy_v2(origin: OriginFor<T>, persona: Vec<u8>) -> DispatchResult {
-            let who = ensure_signed(origin)?;
-            let persona = Self::canonical_persona(&persona)?;
-            let record = Personas::<T>::get(&persona).ok_or(Error::<T>::PersonaNotFound)?;
-            ensure!(
-                T::DidProvider::can_update_policy(&who, record.operator_did.as_slice()),
-                Error::<T>::NotPolicyController
-            );
-            ensure!(
-                PersonaPoliciesV2::<T>::contains_key(&persona),
-                Error::<T>::PolicyNotFound
-            );
-            PersonaPoliciesV2::<T>::remove(&persona);
-            PoliciesV3::<T>::remove(PolicyScopeV3::Persona(persona.clone()));
-            Self::deposit_event(Event::PolicyV2Cleared {
-                scope: PolicyScopeV2::Persona(persona),
-            });
-            Ok(())
+            let _ = (origin, persona);
+            Err(Error::<T>::LegacyPolicyWriteDisabled.into())
         }
 
         #[pallet::call_index(13)]
@@ -1772,16 +1768,8 @@ pub mod pallet {
             signature: Vec<u8>,
             signer_key_id: Vec<u8>,
         ) -> DispatchResult {
-            Self::ensure_unsigned_or_authorized(origin)?;
-            let payload = Self::validate_policy_v2_authorization(
-                &signed_payload,
-                &signature,
-                &signer_key_id,
-            )?;
-            let operator_did = payload.operator_did.clone();
-            Self::apply_policy_v2_operation(&operator_did, payload.operation)?;
-            PolicyV2Nonces::<T>::insert(&operator_did, payload.nonce.saturating_add(1));
-            Ok(())
+            let _ = (origin, signed_payload, signature, signer_key_id);
+            Err(Error::<T>::LegacyPolicyWriteDisabled.into())
         }
 
         #[pallet::call_index(14)]
@@ -1808,7 +1796,7 @@ pub mod pallet {
 
         /// Persona registration/renewal/revocation path for HTTP Directory
         /// requests. The operator's DID key authorizes the mutation while the
-        /// nested admitted-validator signature independently attests DNS.
+        /// nested DNSSEC evidence independently authenticates the TXT record.
         #[pallet::call_index(15)]
         #[pallet::weight(<T as Config>::WeightInfo::apply_persona_with_proof())]
         #[pallet::authorize(|_source, signed_payload, signature, signer_key_id| {
@@ -1819,6 +1807,7 @@ pub mod pallet {
             })
         })]
         #[pallet::weight_of_authorize(<T as Config>::WeightInfo::authorize_apply_persona_with_proof())]
+        #[frame_support::transactional]
         pub fn apply_persona_with_proof(
             origin: OriginFor<T>,
             signed_payload: Vec<u8>,
@@ -1834,21 +1823,40 @@ pub mod pallet {
             Ok(())
         }
 
-        /// Governance admission for accounts allowed to attest DNS checks.
+        /// Obsolete account-attestor admission. Kept at index 16 solely to reject old calls.
         #[pallet::call_index(16)]
         #[pallet::weight(<T as Config>::WeightInfo::set_persona_attestor())]
-        pub fn set_persona_attestor(
-            origin: OriginFor<T>,
-            attestor: T::AccountId,
-            approved: bool,
-        ) -> DispatchResult {
-            T::PersonaAttestorOrigin::ensure_origin(origin)?;
-            if approved {
-                PersonaAttestors::<T>::insert(&attestor, ());
-            } else {
-                PersonaAttestors::<T>::remove(&attestor);
-            }
-            Self::deposit_event(Event::PersonaAttestorUpdated { attestor, approved });
+        pub fn set_persona_attestor(origin: OriginFor<T>, attestor: T::AccountId,
+            approved: bool) -> DispatchResult {
+            T::DnssecTrustAnchorOrigin::ensure_origin(origin)?;
+            let _ = (attestor, approved);
+            Err(Error::<T>::DnssecRequired.into())
+        }
+
+        /// Install or schedule a root DS SHA-256 trust anchor. No per-domain admission exists.
+        #[pallet::call_index(20)]
+        #[pallet::weight(<T as Config>::WeightInfo::set_persona_attestor())]
+        pub fn set_dnssec_root_trust_anchor(origin: OriginFor<T>, key_tag: u16,
+            anchor: DnssecRootTrustAnchor) -> DispatchResult {
+            T::DnssecTrustAnchorOrigin::ensure_origin(origin)?;
+            ensure!([8, 10, 13, 14].contains(&anchor.algorithm)
+                && anchor.digest != [0; 32]
+                && (anchor.valid_until == 0 || anchor.valid_until > anchor.valid_from),
+                Error::<T>::InvalidDnssecTrustAnchor);
+            ensure!(DnssecRootTrustAnchors::<T>::contains_key(key_tag)
+                || DnssecRootTrustAnchors::<T>::iter_keys().take(8).count() < 8,
+                Error::<T>::TooManyDnssecTrustAnchors);
+            DnssecRootTrustAnchors::<T>::insert(key_tag, anchor);
+            Self::deposit_event(Event::DnssecRootTrustAnchorUpdated { key_tag, removed: false });
+            Ok(())
+        }
+
+        #[pallet::call_index(21)]
+        #[pallet::weight(<T as Config>::WeightInfo::set_persona_attestor())]
+        pub fn remove_dnssec_root_trust_anchor(origin: OriginFor<T>, key_tag: u16) -> DispatchResult {
+            T::DnssecTrustAnchorOrigin::ensure_origin(origin)?;
+            DnssecRootTrustAnchors::<T>::remove(key_tag);
+            Self::deposit_event(Event::DnssecRootTrustAnchorUpdated { key_tag, removed: true });
             Ok(())
         }
 
@@ -1864,6 +1872,229 @@ pub mod pallet {
         })]
         #[pallet::weight_of_authorize(T::DbWeight::get().reads(5))]
         pub fn apply_policy_v3_with_proof(
+            origin: OriginFor<T>,
+            signed_payload: Vec<u8>,
+            signature: Vec<u8>,
+            signer_key_id: Vec<u8>,
+        ) -> DispatchResult {
+            let _ = (origin, signed_payload, signature, signer_key_id);
+            Err(Error::<T>::LegacyPolicyWriteDisabled.into())
+        }
+
+        /// Register a non-DNS collective name. Its operator controls the
+        /// policy; recipient membership remains entirely off chain.
+        #[pallet::call_index(18)]
+        #[pallet::weight(<T as Config>::WeightInfo::register_persona())]
+        pub fn register_named_persona(
+            origin: OriginFor<T>,
+            persona: Vec<u8>,
+            operator_did: Vec<u8>,
+            controller_key_ids: Vec<Vec<u8>>,
+            controller_threshold: u8,
+            constraints: Option<RequestedDeliveryConstraints>,
+        ) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            let persona = Self::canonical_persona(&persona)?;
+            ensure!(!persona.contains(&b'.'), Error::<T>::InvalidPersona);
+            ensure!(!Personas::<T>::contains_key(&persona),
+                Error::<T>::PersonaAlreadyExists);
+            let operator_did = Self::did_from_vec(operator_did)?;
+            ensure!(T::DidProvider::did_exists(operator_did.as_slice()),
+                Error::<T>::DidNotFound);
+            ensure!(T::DidProvider::can_update_policy(&who, operator_did.as_slice()),
+                Error::<T>::NotPolicyController);
+            let controllers = Self::controller_keys(controller_key_ids, controller_threshold)?;
+            let constraints = constraints.as_ref()
+                .map(Self::validated_constraints).transpose()?;
+            Personas::<T>::insert(&persona, PersonaRecord::<T> {
+                operator_did: operator_did.clone(),
+                controller_key_ids: controllers,
+                controller_threshold,
+                delivery_constraints: constraints,
+                dns_proof_hash: [0; 32],
+                verified_at: 0,
+                verification_expires_at: 0,
+                revision: 1,
+                active: true,
+            });
+            NonDnsPersonas::<T>::insert(&persona, ());
+            Self::deposit_event(Event::PersonaRegistered { persona, operator_did });
+            Ok(())
+        }
+        #[pallet::call_index(22)]
+        #[pallet::weight(<T as Config>::WeightInfo::policy_document())]
+        #[pallet::authorize(|_source, signed_payload, signature, signer_key_id| {
+            Self::authorize_policy_document(signed_payload, signature, signer_key_id)
+        })]
+        #[pallet::weight_of_authorize(<T as Config>::WeightInfo::policy_document())]
+        #[frame_support::transactional]
+        pub fn apply_policy_document_with_proof(
+            origin: OriginFor<T>, signed_payload: Vec<u8>, signature: Vec<u8>, signer_key_id: Vec<u8>,
+        ) -> DispatchResult {
+            Self::ensure_unsigned_or_authorized(origin)?;
+            let proof = Self::validate_policy_document_authorization(&signed_payload, &signature, &signer_key_id)?;
+            Self::store_policy_document(proof)
+        }
+    }
+
+    impl<T: Config> Pallet<T> {
+        #[cfg(test)]
+        pub(crate) fn legacy_fixture_clear_delivery_policy(origin: OriginFor<T>, did: Vec<u8>) -> DispatchResult {
+            let did = Self::ensure_policy_controller(origin, did)?;
+            ensure!(
+                RecipientPolicies::<T>::contains_key(&did),
+                Error::<T>::PolicyNotFound
+            );
+            RecipientPolicies::<T>::remove(&did);
+            Self::deposit_event(Event::PolicyCleared {
+                scope: PolicyScope::Recipient,
+                did,
+            });
+            Ok(())
+        }
+        #[cfg(test)]
+        pub(crate) fn legacy_fixture_set_tag_policy(
+            origin: OriginFor<T>,
+            tag_did: Vec<u8>,
+            policy: DeliveryPolicy<T>,
+        ) -> DispatchResult {
+            let _ = (origin, tag_did, policy);
+            Err(Error::<T>::LegacyPolicyDeprecated.into())
+        }
+
+        #[cfg(test)]
+        pub(crate) fn legacy_fixture_apply_policy_with_proof(
+            origin: OriginFor<T>,
+            signed_payload: Vec<u8>,
+            signature: Vec<u8>,
+            signer_key_id: Vec<u8>,
+        ) -> DispatchResult {
+            Self::ensure_unsigned_or_authorized(origin)?;
+            let payload =
+                Self::validate_policy_authorization(&signed_payload, &signature, &signer_key_id)?;
+            let did = payload.did.clone();
+            match payload.action {
+                PolicyAction::SetRecipient(policy) => {
+                    let _ = policy;
+                    return Err(Error::<T>::LegacyPolicyDeprecated.into());
+                }
+                PolicyAction::ClearRecipient => {
+                    ensure!(
+                        RecipientPolicies::<T>::contains_key(&did),
+                        Error::<T>::PolicyNotFound
+                    );
+                    RecipientPolicies::<T>::remove(&did);
+                    Self::deposit_event(Event::PolicyCleared {
+                        scope: PolicyScope::Recipient,
+                        did: did.clone(),
+                    });
+                }
+                PolicyAction::SetTag(policy) => {
+                    let _ = policy;
+                    return Err(Error::<T>::LegacyPolicyDeprecated.into());
+                }
+                PolicyAction::SetPersona(policy) => {
+                    let _ = policy;
+                    return Err(Error::<T>::LegacyPolicyDeprecated.into());
+                }
+            }
+            PolicyNonces::<T>::insert(&did, payload.nonce.saturating_add(1));
+            Ok(())
+        }
+
+        #[cfg(test)]
+        pub(crate) fn legacy_fixture_set_did_policy_v2(
+            origin: OriginFor<T>,
+            did: Vec<u8>,
+            policy: DeliveryPolicyV2<T>,
+        ) -> DispatchResult {
+            let did = Self::ensure_policy_controller(origin, did)?;
+            ensure!(policy.operator_did == did, Error::<T>::InvalidPolicyScope);
+            ensure!(
+                policy.scope == PolicyScopeV2::Did(did.clone()),
+                Error::<T>::InvalidPolicyScope
+            );
+            Self::store_policy_v2(policy)
+        }
+
+        #[cfg(test)]
+        pub(crate) fn legacy_fixture_clear_did_policy_v2(origin: OriginFor<T>, did: Vec<u8>) -> DispatchResult {
+            let did = Self::ensure_policy_controller(origin, did)?;
+            ensure!(
+                DidPoliciesV2::<T>::contains_key(&did),
+                Error::<T>::PolicyNotFound
+            );
+            DidPoliciesV2::<T>::remove(&did);
+            PoliciesV3::<T>::remove(PolicyScopeV3::Did(did.clone()));
+            Self::deposit_event(Event::PolicyV2Cleared {
+                scope: PolicyScopeV2::Did(did),
+            });
+            Ok(())
+        }
+
+        #[cfg(test)]
+        pub(crate) fn legacy_fixture_set_persona_policy_v2(
+            origin: OriginFor<T>,
+            persona: Vec<u8>,
+            policy: DeliveryPolicyV2<T>,
+        ) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            let persona = Self::canonical_persona(&persona)?;
+            let record = Self::active_persona(&persona)?;
+            ensure!(
+                T::DidProvider::can_update_policy(&who, record.operator_did.as_slice()),
+                Error::<T>::NotPolicyController
+            );
+            ensure!(
+                policy.operator_did == record.operator_did
+                    && policy.scope == PolicyScopeV2::Persona(persona),
+                Error::<T>::InvalidPolicyScope
+            );
+            Self::store_policy_v2(policy)
+        }
+
+        #[cfg(test)]
+        pub(crate) fn legacy_fixture_clear_persona_policy_v2(origin: OriginFor<T>, persona: Vec<u8>) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            let persona = Self::canonical_persona(&persona)?;
+            let record = Personas::<T>::get(&persona).ok_or(Error::<T>::PersonaNotFound)?;
+            ensure!(
+                T::DidProvider::can_update_policy(&who, record.operator_did.as_slice()),
+                Error::<T>::NotPolicyController
+            );
+            ensure!(
+                PersonaPoliciesV2::<T>::contains_key(&persona),
+                Error::<T>::PolicyNotFound
+            );
+            PersonaPoliciesV2::<T>::remove(&persona);
+            PoliciesV3::<T>::remove(PolicyScopeV3::Persona(persona.clone()));
+            Self::deposit_event(Event::PolicyV2Cleared {
+                scope: PolicyScopeV2::Persona(persona),
+            });
+            Ok(())
+        }
+
+        #[cfg(test)]
+        pub(crate) fn legacy_fixture_apply_policy_v2_with_proof(
+            origin: OriginFor<T>,
+            signed_payload: Vec<u8>,
+            signature: Vec<u8>,
+            signer_key_id: Vec<u8>,
+        ) -> DispatchResult {
+            Self::ensure_unsigned_or_authorized(origin)?;
+            let payload = Self::validate_policy_v2_authorization(
+                &signed_payload,
+                &signature,
+                &signer_key_id,
+            )?;
+            let operator_did = payload.operator_did.clone();
+            Self::apply_policy_v2_operation(&operator_did, payload.operation)?;
+            PolicyV2Nonces::<T>::insert(&operator_did, payload.nonce.saturating_add(1));
+            Ok(())
+        }
+
+        #[cfg(test)]
+        pub(crate) fn legacy_fixture_apply_policy_v3_with_proof(
             origin: OriginFor<T>,
             signed_payload: Vec<u8>,
             signature: Vec<u8>,
@@ -1899,65 +2130,8 @@ pub mod pallet {
             PolicyV3Nonces::<T>::insert(owner, payload.nonce.saturating_add(1));
             Ok(())
         }
-
-        /// Register a non-DNS collective name. Its operator controls the
-        /// policy; recipient membership remains entirely off chain.
-        #[pallet::call_index(18)]
-        #[pallet::weight(<T as Config>::WeightInfo::register_persona())]
-        pub fn register_named_persona(
-            origin: OriginFor<T>,
-            persona: Vec<u8>,
-            operator_did: Vec<u8>,
-            controller_key_ids: Vec<Vec<u8>>,
-            controller_threshold: u8,
-            constraints: Option<RequestedDeliveryConstraints>,
-        ) -> DispatchResult {
-            let who = ensure_signed(origin)?;
-            let persona = Self::canonical_persona(&persona)?;
-            ensure!(!persona.contains(&b'.'), Error::<T>::InvalidPersona);
-            ensure!(
-                !Personas::<T>::contains_key(&persona),
-                Error::<T>::PersonaAlreadyExists
-            );
-            let operator_did = Self::did_from_vec(operator_did)?;
-            ensure!(
-                T::DidProvider::did_exists(operator_did.as_slice()),
-                Error::<T>::DidNotFound
-            );
-            ensure!(
-                T::DidProvider::can_update_policy(&who, operator_did.as_slice()),
-                Error::<T>::NotPolicyController
-            );
-            let controllers = Self::controller_keys(controller_key_ids, controller_threshold)?;
-            let constraints = constraints
-                .as_ref()
-                .map(Self::validated_constraints)
-                .transpose()?;
-            Personas::<T>::insert(
-                &persona,
-                PersonaRecord::<T> {
-                    operator_did: operator_did.clone(),
-                    controller_key_ids: controllers,
-                    controller_threshold,
-                    delivery_constraints: constraints,
-                    dns_proof_hash: [0; 32],
-                    verified_at: 0,
-                    verification_expires_at: 0,
-                    revision: 1,
-                    active: true,
-                },
-            );
-            NonDnsPersonas::<T>::insert(&persona, ());
-            Self::deposit_event(Event::PersonaRegistered {
-                persona,
-                operator_did,
-            });
-            Ok(())
-        }
-    }
-
-    impl<T: Config> Pallet<T> {
-        /// Remove every delivery-policy entry whose storage key is this DID.
+        /// Remove legacy entries for this DID and retain an opaque-policy tombstone.
+        /// The durable opaque owner nonce is never reset by identity deletion.
         ///
         /// This is called by the DID registry when a root-authorized deletion
         /// removes the DID itself. Persona records and persona V2 policies are
@@ -1975,6 +2149,7 @@ pub mod pallet {
             PersonaOperatorNonces::<T>::remove(&did);
             DidPoliciesV2::<T>::remove(&did);
             PolicyV2Nonces::<T>::remove(&did);
+            Self::invalidate_policy_document(&PolicyScopeV3::Did(did.clone()));
             PoliciesV3::<T>::remove(PolicyScopeV3::Did(did.clone()));
             PolicyV3Nonces::<T>::remove(&did);
         }
@@ -1997,7 +2172,7 @@ pub mod pallet {
             }
         }
 
-        fn ensure_unsigned_or_authorized(origin: OriginFor<T>) -> DispatchResult {
+        pub(crate) fn ensure_unsigned_or_authorized(origin: OriginFor<T>) -> DispatchResult {
             match origin.into() {
                 Ok(frame_system::RawOrigin::None) | Ok(frame_system::RawOrigin::Authorized) => {
                     Ok(())
@@ -2076,6 +2251,39 @@ pub mod pallet {
 
         pub(crate) fn validate_unsigned_call(call: &Call<T>) -> TransactionValidity {
             match call {
+                Call::apply_policy_with_proof { .. } | Call::apply_policy_v2_with_proof { .. }
+                | Call::apply_policy_v3_with_proof { .. } => InvalidTransaction::Call.into(),
+                Call::apply_persona_with_proof {
+                    signed_payload,
+                    signature,
+                    signer_key_id,
+                } => {
+                    let payload = match Self::validate_persona_authorization(
+                        signed_payload,
+                        signature,
+                        signer_key_id,
+                    ) {
+                        Ok(payload) => payload,
+                        Err(_) => return InvalidTransaction::BadProof.into(),
+                    };
+                    // Reject invalid domain evidence before admitting an unsigned mutation to the pool.
+                    if Self::validate_persona_dnssec_operation(&payload.operator_did, &payload.operation).is_err() {
+                        return InvalidTransaction::BadProof.into();
+                    }
+                    ValidTransaction::with_tag_prefix("OpenPayloadPersona")
+                        .priority(975)
+                        .and_provides((payload.operator_did, payload.nonce))
+                        .longevity(64)
+                        .propagate(true)
+                        .build()
+                }
+                _ => InvalidTransaction::Call.into(),
+            }
+        }
+
+        #[cfg(test)]
+        pub(crate) fn legacy_fixture_validate_unsigned_call(call: &Call<T>) -> TransactionValidity {
+            match call {
                 Call::apply_policy_with_proof {
                     signed_payload,
                     signature,
@@ -2149,6 +2357,10 @@ pub mod pallet {
                         Ok(payload) => payload,
                         Err(_) => return InvalidTransaction::BadProof.into(),
                     };
+                    // Reject invalid domain evidence before admitting an unsigned mutation to the pool.
+                    if Self::validate_persona_dnssec_operation(&payload.operator_did, &payload.operation).is_err() {
+                        return InvalidTransaction::BadProof.into();
+                    }
                     ValidTransaction::with_tag_prefix("OpenPayloadPersona")
                         .priority(975)
                         .and_provides((payload.operator_did, payload.nonce))
@@ -2165,6 +2377,8 @@ pub mod pallet {
             tag: Option<&[u8]>,
             persona: Option<&[u8]>,
         ) -> Option<DeliveryPolicy<T>> {
+            assert!(!Self::has_policy_document_override(recipient, persona),
+                "OpaquePolicyRequiresOffchainResolution");
             if let Some(persona) = persona.and_then(Self::did_from_slice) {
                 if let Some(policy) = PersonaPolicies::<T>::get(persona) {
                     return Some(policy);
@@ -2217,7 +2431,7 @@ pub mod pallet {
             DidOf::<T>::try_from(did).map_err(|_| Error::<T>::DidTooLong.into())
         }
 
-        fn canonical_persona(raw: &[u8]) -> Result<PersonaOf<T>, DispatchError> {
+        pub(crate) fn canonical_persona(raw: &[u8]) -> Result<PersonaOf<T>, DispatchError> {
             let mut value = raw;
             while value.first().is_some_and(u8::is_ascii_whitespace) {
                 value = &value[1..];
@@ -2305,44 +2519,37 @@ pub mod pallet {
             Ok(keys)
         }
 
-        #[allow(clippy::too_many_arguments)]
-        fn verify_persona_attestation(
-            persona: &PersonaOf<T>,
-            operator_did: &DidOf<T>,
-            dns_proof_hash: [u8; 32],
-            challenge_nonce: u64,
-            verification_expires_at: u64,
-            attestor: &T::AccountId,
-            signature: &[u8],
-        ) -> DispatchResult {
-            ensure!(
-                challenge_nonce == PersonaNonces::<T>::get(persona),
-                Error::<T>::InvalidPersonaNonce
-            );
-            let now = pallet_timestamp::Pallet::<T>::get().saturated_into::<u64>();
-            ensure!(
-                verification_expires_at > now,
-                Error::<T>::PersonaVerificationExpired
-            );
-            ensure!(
-                PersonaAttestors::<T>::contains_key(attestor),
-                Error::<T>::PersonaAttestorNotApproved
-            );
-            let payload = PersonaAttestationPayload::<T> {
-                domain: BoundedVec::truncate_from(PERSONA_ATTESTATION_DOMAIN.to_vec()),
-                genesis_hash: frame_system::Pallet::<T>::block_hash(BlockNumberFor::<T>::zero()),
-                persona: persona.clone(),
-                operator_did: operator_did.clone(),
-                dns_proof_hash,
-                challenge_nonce,
-                verification_expires_at,
-            }
-            .encode();
-            ensure!(
-                T::PersonaAttestationProvider::verify_attestation(attestor, &payload, signature),
-                Error::<T>::InvalidPersonaAttestation
-            );
-            Ok(())
+        /// Public runtime preflight uses the same verifier as dispatch, against finalized state.
+        pub fn verify_dnssec_txt(record_name: Vec<u8>, record_value: Vec<u8>, proof: Vec<u8>) -> Option<u64> {
+            if record_name.len() > 254 || record_value.len() > 4096 { return None; }
+            let name = core::str::from_utf8(&record_name).ok()?;
+            let now = Self::recovery_now();
+            let anchors: Vec<_> = DnssecRootTrustAnchors::<T>::iter().take(8)
+                .filter(|(_, a)| a.valid_from <= now && (a.valid_until == 0 || now < a.valid_until))
+                .map(|(tag, a)| dnssec_prover::rr::DS { name: ".".try_into().expect("valid root"),
+                    key_tag: tag, alg: a.algorithm, digest_type: 2, digest: a.digest.to_vec() }).collect();
+            dnssec::verify_txt(&anchors, now, name, &record_value, &proof).ok()
+        }
+
+        fn verify_persona_dnssec(persona: &PersonaOf<T>, operator_did: &DidOf<T>,
+            dns_proof_hash: [u8; 32], challenge_nonce: u64, verification_expires_at: u64,
+            challenge_expires_at: u64, dnssec_proof: &[u8], action: &[u8], request_id: &[u8; 32])
+            -> Result<u64, DispatchError> {
+            ensure!(challenge_nonce == PersonaNonces::<T>::get(persona), Error::<T>::InvalidPersonaNonce);
+            let now = Self::recovery_now();
+            ensure!(challenge_expires_at > now && challenge_expires_at <= now.saturating_add(48 * 3_600_000)
+                && verification_expires_at > now
+                && verification_expires_at <= now.saturating_add(365 * 86_400_000), Error::<T>::PersonaVerificationExpired);
+            let genesis = frame_system::Pallet::<T>::block_hash(BlockNumberFor::<T>::zero());
+            let value = dnssec::challenge_value(genesis.as_ref(), persona, operator_did, action,
+                challenge_nonce, challenge_expires_at, request_id);
+            let mut name = b"_openpayload-persona.".to_vec(); name.extend_from_slice(persona);
+            let mut hash_material = name.clone(); hash_material.push(b'\n'); hash_material.extend_from_slice(&value);
+            ensure!(sp_io::hashing::sha2_256(&hash_material) == dns_proof_hash, Error::<T>::InvalidDnssecProof);
+            name.push(b'.');
+            let expiry = Self::verify_dnssec_txt(name, value, dnssec_proof.to_vec())
+                .ok_or(Error::<T>::InvalidDnssecProof)?;
+            Ok(expiry.min(challenge_expires_at))
         }
 
         fn network_constraints() -> DeliveryConstraints {
@@ -2501,15 +2708,13 @@ pub mod pallet {
             Self::minimum_constraints(base.clone(), override_ceiling)
         }
 
-        fn active_persona(persona: &PersonaOf<T>) -> Result<PersonaRecord<T>, DispatchError> {
+        pub(crate) fn active_persona(persona: &PersonaOf<T>) -> Result<PersonaRecord<T>, DispatchError> {
             let record = Personas::<T>::get(persona).ok_or(Error::<T>::PersonaNotFound)?;
             ensure!(record.active, Error::<T>::PersonaInactive);
             if !NonDnsPersonas::<T>::contains_key(persona) {
-                ensure!(
-                    record.verification_expires_at
-                        > pallet_timestamp::Pallet::<T>::get().saturated_into::<u64>(),
-                    Error::<T>::PersonaVerificationExpired
-                );
+                ensure!(record.verification_expires_at
+                    > pallet_timestamp::Pallet::<T>::get().saturated_into::<u64>(),
+                    Error::<T>::PersonaVerificationExpired);
             }
             Ok(record)
         }
@@ -2530,7 +2735,7 @@ pub mod pallet {
                 .map_err(|_| Error::<T>::InvalidPolicyId.into())
         }
 
-        fn policy_v3_owner(scope: &PolicyScopeV3<T>) -> Result<DidOf<T>, DispatchError> {
+        pub(crate) fn policy_v3_owner(scope: &PolicyScopeV3<T>) -> Result<DidOf<T>, DispatchError> {
             match scope {
                 PolicyScopeV3::Did(did) => {
                     ensure!(
@@ -2617,30 +2822,21 @@ pub mod pallet {
                 }
                 Self::validate_action(&rule.action, constraints.max_replicas)?;
                 if let PolicyActionV2::DeliveryPlanV1(plan) = &rule.action {
-                    let require_steps: Vec<_> = plan
-                        .steps
-                        .iter()
-                        .filter(|step| {
-                            matches!(step.operation, DeliveryStepOperation::RequireProfile)
-                        })
+                    let require_steps: Vec<_> = plan.steps.iter()
+                        .filter(|step| matches!(step.operation,
+                            DeliveryStepOperation::RequireProfile))
                         .collect();
                     if !require_steps.is_empty() {
-                        ensure!(
-                            matches!(policy.scope, PolicyScopeV3::Persona(_))
-                                && require_steps.len() == 1
-                                && plan.entry_step == require_steps[0].id
-                                && plan.steps.iter().any(|step| matches!(
-                                    step.operation,
-                                    DeliveryStepOperation::Forward { .. }
-                                        | DeliveryStepOperation::Store { .. }
-                                ))
-                                && plan
-                                    .transitions
-                                    .iter()
-                                    .filter(|edge| edge.from == require_steps[0].id)
-                                    .all(|edge| matches!(edge.trigger, TransitionTrigger::Success)),
-                            Error::<T>::InvalidDeliveryPlan
-                        );
+                        ensure!(matches!(policy.scope, PolicyScopeV3::Persona(_))
+                            && require_steps.len() == 1
+                            && plan.entry_step == require_steps[0].id
+                            && plan.steps.iter().any(|step| matches!(step.operation,
+                                DeliveryStepOperation::Forward { .. }
+                                    | DeliveryStepOperation::Store { .. }))
+                            && plan.transitions.iter()
+                                .filter(|edge| edge.from == require_steps[0].id)
+                                .all(|edge| matches!(edge.trigger, TransitionTrigger::Success)),
+                            Error::<T>::InvalidDeliveryPlan);
                     }
                     units = units
                         .saturating_add(plan.steps.len() as u32)
@@ -2673,43 +2869,36 @@ pub mod pallet {
                                 ensure!(!is_application, Error::<T>::InvalidPolicyScope);
                                 units = units.saturating_add(targets.len() as u32);
                             }
-                            DeliveryStepOperation::Call {
-                                registered_domain, ..
-                            } => {
-                                if let PolicyScopeV3::Application(application_id) = &policy.scope {
-                                    ensure!(
-                                        T::ApplicationProvider::verified_domain(
-                                            application_id.as_slice()
-                                        )
-                                        .is_some_and(
-                                            |name| name.as_slice() == registered_domain.as_slice()
-                                        ),
-                                        Error::<T>::InvalidCallDomain
-                                    );
-                                } else {
-                                    let registration = Self::active_persona(registered_domain)?;
-                                    ensure!(
-                                        registration.operator_did == policy.operator_did,
-                                        Error::<T>::InvalidCallDomain
-                                    );
-                                }
+                            DeliveryStepOperation::Call { url, .. } => {
+                                let domain = match &policy.scope {
+                                    PolicyScopeV3::Application(application_id) =>
+                                        T::ApplicationProvider::verified_domain(application_id.as_slice())
+                                            .ok_or(Error::<T>::InvalidCallDomain)?,
+                                    PolicyScopeV3::Persona(name) => {
+                                        ensure!(!NonDnsPersonas::<T>::contains_key(name),
+                                            Error::<T>::InvalidCallDomain);
+                                        let registration = Self::active_persona(name)?;
+                                        ensure!(registration.operator_did == policy.operator_did,
+                                            Error::<T>::InvalidCallDomain);
+                                        name.to_vec()
+                                    }
+                                    PolicyScopeV3::Did(_) => return Err(Error::<T>::InvalidCallDomain.into()),
+                                };
+                                ensure!(crate::call_url::authorized(url.as_slice(), &domain),
+                                    Error::<T>::InvalidCallDomain);
                             }
                             DeliveryStepOperation::Send { recipient_did, .. } => {
                                 if let PolicyScopeV3::Application(application_id) = &policy.scope {
                                     ensure!(
                                         T::ApplicationProvider::authorized_send_target(
-                                            application_id.as_slice(),
-                                            recipient_did.as_slice()
-                                        ),
+                                            application_id.as_slice(), recipient_did.as_slice()),
                                         Error::<T>::InvalidPolicyScope
                                     );
                                 }
                             }
                             DeliveryStepOperation::RequireProfile => {
-                                ensure!(
-                                    !event_bound && !is_application,
-                                    Error::<T>::InvalidDeliveryPlan
-                                );
+                                ensure!(!event_bound && !is_application,
+                                    Error::<T>::InvalidDeliveryPlan);
                             }
                         }
                     }
@@ -3054,28 +3243,11 @@ pub mod pallet {
                             Error::<T>::InvalidPayloadTemplate
                         );
                     }
-                    DeliveryStepOperation::Call {
-                        service_did,
-                        service_id,
-                        registered_domain,
-                        payload_template,
-                    } => {
-                        ensure!(
-                            T::DidProvider::service_supports_delivery(
-                                service_did.as_slice(),
-                                service_id.as_slice(),
-                                DeliveryServiceKind::ApplicationControl,
-                            ),
-                            Error::<T>::InvalidRouteTarget
-                        );
-                        ensure!(
-                            registered_domain.contains(&b'.'),
-                            Error::<T>::InvalidCallDomain
-                        );
-                        ensure!(
-                            Self::valid_payload_template(payload_template.as_slice()),
-                            Error::<T>::InvalidPayloadTemplate
-                        );
+                    DeliveryStepOperation::Call { url, payload_template } => {
+                        ensure!(crate::call_url::host(url.as_slice()).is_some(),
+                            Error::<T>::InvalidCallDomain);
+                        ensure!(Self::valid_payload_template(payload_template.as_slice()),
+                            Error::<T>::InvalidPayloadTemplate);
                     }
                     DeliveryStepOperation::RequireProfile => {}
                 }
@@ -3274,6 +3446,7 @@ pub mod pallet {
         fn decode_persona_payload(
             signed_payload: &[u8],
         ) -> Result<PersonaAuthorizationPayload<T>, Error<T>> {
+            ensure!(signed_payload.len() <= 73_728, Error::<T>::InvalidPersonaPayload);
             let mut bytes = signed_payload;
             let payload = PersonaAuthorizationPayload::<T>::decode(&mut bytes)
                 .map_err(|_| Error::<T>::InvalidPersonaPayload)?;
@@ -3326,6 +3499,32 @@ pub mod pallet {
             Ok(payload)
         }
 
+        fn validate_persona_dnssec_operation(operator: &DidOf<T>, operation: &PersonaOperation<T>) -> DispatchResult {
+            match operation {
+                PersonaOperation::Register { persona, dns_proof_hash, challenge_nonce,
+                    verification_expires_at, challenge_expires_at, dnssec_proof, .. } => {
+                    Self::verify_persona_dnssec(persona, operator, *dns_proof_hash, *challenge_nonce,
+                        *verification_expires_at, *challenge_expires_at, dnssec_proof, b"register_persona", &[0; 32])?;
+                }
+                PersonaOperation::Renew { persona, dns_proof_hash, challenge_nonce,
+                    verification_expires_at, challenge_expires_at, dnssec_proof, .. } => {
+                    Self::verify_persona_dnssec(persona, operator, *dns_proof_hash, *challenge_nonce,
+                        *verification_expires_at, *challenge_expires_at, dnssec_proof, b"renew_persona", &[0; 32])?;
+                }
+                PersonaOperation::Transfer { persona, new_operator_did, dns_proof_hash, challenge_nonce,
+                    verification_expires_at, challenge_expires_at, dnssec_proof, .. } => {
+                    Self::verify_persona_dnssec(persona, new_operator_did, *dns_proof_hash, *challenge_nonce,
+                        *verification_expires_at, *challenge_expires_at, dnssec_proof, b"transfer_persona", &[0; 32])?;
+                }
+                PersonaOperation::StartRecovery { persona, recovery_id, proof, .. }
+                | PersonaOperation::ProveRecovery { persona, recovery_id, proof } => {
+                    Self::verify_recovery_proof(persona, recovery_id, operator, proof)?;
+                }
+                _ => (),
+            }
+            Ok(())
+        }
+
         fn ensure_policy_v2_signer_authorized(
             operator_did: &DidOf<T>,
             operation: &PolicyV2Operation<T>,
@@ -3359,12 +3558,27 @@ pub mod pallet {
             signer_key_id: &SignerKeyId,
         ) -> Result<(), Error<T>> {
             match operation {
+                PersonaOperation::StartRecovery { controller_key_ids, controller_threshold, .. } => {
+                    ensure!(*controller_threshold == 1 && controller_key_ids.contains(signer_key_id),
+                        Error::<T>::InvalidPersonaController);
+                }
+                PersonaOperation::ProveRecovery { persona, recovery_id, .. }
+                | PersonaOperation::FinalizeRecovery { persona, recovery_id } => {
+                    let request = PersonaRecoveries::<T>::get(persona, recovery_id)
+                        .ok_or(Error::<T>::RecoveryNotFound)?;
+                    ensure!(request.operator_did == *operator_did
+                        && request.controller_key_ids.contains(signer_key_id), Error::<T>::InvalidPersonaController);
+                }
+                PersonaOperation::CancelRecovery { persona, .. } => {
+                    let current = Personas::<T>::get(persona).ok_or(Error::<T>::PersonaNotFound)?;
+                    ensure!(current.operator_did == *operator_did
+                        && current.controller_key_ids.contains(signer_key_id), Error::<T>::InvalidPersonaController);
+                }
                 PersonaOperation::Register {
                     controller_key_ids,
                     controller_threshold,
                     ..
-                }
-                | PersonaOperation::RegisterNamed {
+                } | PersonaOperation::RegisterNamed {
                     controller_key_ids,
                     controller_threshold,
                     ..
@@ -3405,6 +3619,46 @@ pub mod pallet {
             Ok(())
         }
 
+
+        fn recovery_now() -> u64 {
+            pallet_timestamp::Pallet::<T>::get().saturated_into::<u64>()
+        }
+
+        fn pending_recovery(persona: &PersonaOf<T>, id: &[u8; 32])
+            -> Result<PersonaRecoveryRecord<T>, Error<T>> {
+            ensure!(DnssecRecoveryIds::<T>::contains_key(persona, id), Error::<T>::DnssecRequired);
+            let request = PersonaRecoveries::<T>::get(persona, id).ok_or(Error::<T>::RecoveryNotFound)?;
+            ensure!(request.expires_at > Self::recovery_now(), Error::<T>::RecoveryExpired);
+            Ok(request)
+        }
+
+        fn prune_persona_recoveries(persona: &PersonaOf<T>) {
+            let now = Self::recovery_now();
+            PersonaRecoveryIds::<T>::mutate(persona, |ids| ids.retain(|id| {
+                let keep = DnssecRecoveryIds::<T>::contains_key(persona, id)
+                    && PersonaRecoveries::<T>::get(persona, id).is_some_and(|r| r.expires_at > now);
+                if !keep { PersonaRecoveries::<T>::remove(persona, id); DnssecRecoveryIds::<T>::remove(persona, id); }
+                keep
+            }));
+        }
+
+        fn update_recovery_proof(request: &mut PersonaRecoveryRecord<T>, proof: &PersonaRecoveryProof) {
+            if proof.factors & 1 != 0 { request.dns_valid_until = proof.proof_valid_until; }
+            request.email_valid_until = 0;
+            request.verification_expires_at = proof.verification_expires_at;
+            request.proof_hash = proof.proof_hash;
+        }
+
+        fn verify_recovery_proof(persona: &PersonaOf<T>, id: &[u8; 32],
+            operator_did: &DidOf<T>, proof: &PersonaRecoveryProof) -> DispatchResult {
+            ensure!(proof.factors == 1, Error::<T>::InvalidRecoveryProof);
+            let verified_until = Self::verify_persona_dnssec(persona, operator_did, proof.proof_hash,
+                proof.challenge_nonce, proof.verification_expires_at, proof.challenge_expires_at,
+                &proof.dnssec_proof, b"recover_persona", id)?;
+            ensure!(proof.proof_valid_until <= verified_until, Error::<T>::InvalidRecoveryProof);
+            Ok(())
+        }
+
         fn validate_controller_keys(keys: &ControllerKeysOf<T>, threshold: u8) -> DispatchResult {
             ensure!(!keys.is_empty(), Error::<T>::InvalidPersonaController);
             ensure!(
@@ -3426,44 +3680,113 @@ pub mod pallet {
             operation: PersonaOperation<T>,
         ) -> DispatchResult {
             match operation {
+                PersonaOperation::StartRecovery { persona, recovery_id, controller_key_ids,
+                    controller_threshold, preserve_policy, proof } => {
+                    let current = Personas::<T>::get(&persona).ok_or(Error::<T>::PersonaNotFound)?;
+                    ensure!(Self::canonical_persona(persona.as_slice())? == persona
+                        && persona.contains(&b'.') && !NonDnsPersonas::<T>::contains_key(&persona),
+                        Error::<T>::InvalidPersona);
+                    ensure!(current.operator_did != *operator_did, Error::<T>::InvalidPersonaController);
+                    Self::validate_controller_keys(&controller_key_ids, controller_threshold)?;
+                    Self::verify_recovery_proof(&persona, &recovery_id, operator_did, &proof)?;
+                    Self::prune_persona_recoveries(&persona);
+                    ensure!(!PersonaRecoveries::<T>::contains_key(&persona, recovery_id),
+                        Error::<T>::RecoveryAlreadyExists);
+                    let mut ids = PersonaRecoveryIds::<T>::get(&persona);
+                    ids.try_push(recovery_id).map_err(|_| Error::<T>::TooManyRecoveries)?;
+                    let now = Self::recovery_now();
+                    let mut request = PersonaRecoveryRecord::<T> {
+                        operator_did: operator_did.clone(), controller_key_ids, controller_threshold,
+                        preserve_policy, started_at: now, expires_at: now.saturating_add(14 * 86_400_000),
+                        dns_valid_until: 0, email_valid_until: 0, verification_expires_at: 0,
+                        proof_hash: [0; 32], cancelled: false,
+                    };
+                    Self::update_recovery_proof(&mut request, &proof);
+                    PersonaRecoveries::<T>::insert(&persona, recovery_id, request);
+                    PersonaRecoveryIds::<T>::insert(&persona, ids);
+                    DnssecRecoveryIds::<T>::insert(&persona, recovery_id, ());
+                    Self::deposit_event(Event::PersonaRecoveryStarted {
+                        persona, recovery_id, operator_did: operator_did.clone() });
+                }
+                PersonaOperation::ProveRecovery { persona, recovery_id, proof } => {
+                    Self::verify_recovery_proof(&persona, &recovery_id, operator_did, &proof)?;
+                    let mut request = Self::pending_recovery(&persona, &recovery_id)?;
+                    Self::update_recovery_proof(&mut request, &proof);
+                    PersonaRecoveries::<T>::insert(&persona, recovery_id, request);
+                    Self::deposit_event(Event::PersonaRecoveryUpdated { persona, recovery_id });
+                }
+                PersonaOperation::CancelRecovery { persona, recovery_id } => {
+                    let mut request = Self::pending_recovery(&persona, &recovery_id)?;
+                    request.cancelled = true; // An objection never resets started_at or vetoes eligibility.
+                    PersonaRecoveries::<T>::insert(&persona, recovery_id, request);
+                    Self::deposit_event(Event::PersonaRecoveryCancelled { persona, recovery_id });
+                }
+                PersonaOperation::FinalizeRecovery { persona, recovery_id } => {
+                    let request = Self::pending_recovery(&persona, &recovery_id)?;
+                    let now = Self::recovery_now();
+                    let dns = request.dns_valid_until > now;
+                    ensure!(dns && now >= request.started_at.saturating_add(7 * 86_400_000), Error::<T>::RecoveryNotReady);
+                    ensure!(request.verification_expires_at > now, Error::<T>::PersonaVerificationExpired);
+                    let mut current = Personas::<T>::get(&persona).ok_or(Error::<T>::PersonaNotFound)?;
+                    current.operator_did = operator_did.clone();
+                    current.controller_key_ids = request.controller_key_ids;
+                    current.controller_threshold = request.controller_threshold;
+                    current.dns_proof_hash = request.proof_hash;
+                    current.verified_at = now;
+                    current.verification_expires_at = request.verification_expires_at;
+                    current.revision = current.revision.saturating_add(1);
+                    current.active = true;
+                    Personas::<T>::insert(&persona, current);
+                    if request.preserve_policy {
+                        PoliciesV4::<T>::mutate(PolicyScopeV3::Persona(persona.clone()), |p| { if let Some(p) = p { p.operator_did = operator_did.clone(); } });
+                        // Update ownership metadata only; retain rules, graphs, ids and revisions.
+                        PersonaPoliciesV2::<T>::mutate(&persona, |policy| {
+                            if let Some(policy) = policy { policy.operator_did = operator_did.clone(); }
+                        });
+                        PoliciesV3::<T>::mutate(PolicyScopeV3::Persona(persona.clone()), |policy| {
+                            if let Some(policy) = policy { policy.operator_did = operator_did.clone(); }
+                        });
+                    } else {
+                        Self::invalidate_policy_document(&PolicyScopeV3::Persona(persona.clone()));
+                        PersonaPoliciesV2::<T>::remove(&persona);
+                        PoliciesV3::<T>::remove(PolicyScopeV3::Persona(persona.clone()));
+                    }
+                    PersonaNonces::<T>::mutate(&persona, |nonce| *nonce = nonce.saturating_add(1));
+                    for id in PersonaRecoveryIds::<T>::take(&persona) {
+                        PersonaRecoveries::<T>::remove(&persona, id);
+                        DnssecRecoveryIds::<T>::remove(&persona, id);
+                    }
+                    Self::deposit_event(Event::PersonaRecovered {
+                        persona, operator_did: operator_did.clone(), preserve_policy: request.preserve_policy });
+                }
+
                 PersonaOperation::RegisterNamed {
                     persona,
                     controller_key_ids,
                     controller_threshold,
                     constraints,
                 } => {
-                    ensure!(
-                        Self::canonical_persona(persona.as_slice())? == persona
-                            && !persona.contains(&b'.'),
-                        Error::<T>::InvalidPersona
-                    );
-                    ensure!(
-                        !Personas::<T>::contains_key(&persona),
-                        Error::<T>::PersonaAlreadyExists
-                    );
+                    ensure!(Self::canonical_persona(persona.as_slice())? == persona
+                        && !persona.contains(&b'.'), Error::<T>::InvalidPersona);
+                    ensure!(!Personas::<T>::contains_key(&persona),
+                        Error::<T>::PersonaAlreadyExists);
                     Self::validate_controller_keys(&controller_key_ids, controller_threshold)?;
-                    let constraints = constraints
-                        .as_ref()
-                        .map(Self::validated_constraints)
-                        .transpose()?;
-                    Personas::<T>::insert(
-                        &persona,
-                        PersonaRecord::<T> {
-                            operator_did: operator_did.clone(),
-                            controller_key_ids,
-                            controller_threshold,
-                            delivery_constraints: constraints,
-                            dns_proof_hash: [0; 32],
-                            verified_at: 0,
-                            verification_expires_at: 0,
-                            revision: 1,
-                            active: true,
-                        },
-                    );
+                    let constraints = constraints.as_ref()
+                        .map(Self::validated_constraints).transpose()?;
+                    Personas::<T>::insert(&persona, PersonaRecord::<T> {
+                        operator_did: operator_did.clone(),
+                        controller_key_ids,
+                        controller_threshold,
+                        delivery_constraints: constraints,
+                        dns_proof_hash: [0; 32],
+                        verified_at: 0,
+                        verification_expires_at: 0,
+                        revision: 1,
+                        active: true,
+                    });
                     NonDnsPersonas::<T>::insert(&persona, ());
                     Self::deposit_event(Event::PersonaRegistered {
-                        persona,
-                        operator_did: operator_did.clone(),
+                        persona, operator_did: operator_did.clone(),
                     });
                 }
                 PersonaOperation::Register {
@@ -3474,8 +3797,8 @@ pub mod pallet {
                     dns_proof_hash,
                     challenge_nonce,
                     verification_expires_at,
-                    attestor,
-                    attestation_signature,
+                    challenge_expires_at,
+                    dnssec_proof,
                 } => {
                     ensure!(persona.contains(&b'.'), Error::<T>::InvalidPersona);
                     ensure!(
@@ -3491,14 +3814,15 @@ pub mod pallet {
                         .as_ref()
                         .map(Self::validated_constraints)
                         .transpose()?;
-                    Self::verify_persona_attestation(
+                    Self::verify_persona_dnssec(
                         &persona,
                         operator_did,
                         dns_proof_hash,
                         challenge_nonce,
                         verification_expires_at,
-                        &attestor,
-                        &attestation_signature,
+                        challenge_expires_at,
+                        &dnssec_proof,
+                        b"register_persona", &[0; 32],
                     )?;
                     let now = pallet_timestamp::Pallet::<T>::get().saturated_into::<u64>();
                     Personas::<T>::insert(
@@ -3527,13 +3851,11 @@ pub mod pallet {
                     dns_proof_hash,
                     challenge_nonce,
                     verification_expires_at,
-                    attestor,
-                    attestation_signature,
+                    challenge_expires_at,
+                    dnssec_proof,
                 } => {
-                    ensure!(
-                        !NonDnsPersonas::<T>::contains_key(&persona),
-                        Error::<T>::InvalidPersona
-                    );
+                    ensure!(!NonDnsPersonas::<T>::contains_key(&persona),
+                        Error::<T>::InvalidPersona);
                     ensure!(
                         Self::canonical_persona(persona.as_slice())? == persona,
                         Error::<T>::InvalidPersona
@@ -3544,14 +3866,15 @@ pub mod pallet {
                         record.operator_did == *operator_did,
                         Error::<T>::InvalidPersonaController
                     );
-                    Self::verify_persona_attestation(
+                    Self::verify_persona_dnssec(
                         &persona,
                         operator_did,
                         dns_proof_hash,
                         challenge_nonce,
                         verification_expires_at,
-                        &attestor,
-                        &attestation_signature,
+                        challenge_expires_at,
+                        &dnssec_proof,
+                        b"renew_persona", &[0; 32],
                     )?;
                     if let Some(constraints) = constraints.as_ref() {
                         record.delivery_constraints =
@@ -3614,8 +3937,8 @@ pub mod pallet {
                     dns_proof_hash,
                     challenge_nonce,
                     verification_expires_at,
-                    attestor,
-                    attestation_signature,
+                    challenge_expires_at,
+                    dnssec_proof,
                     new_operator_signer_key_id,
                     new_operator_signature,
                 } => {
@@ -3638,14 +3961,15 @@ pub mod pallet {
                         .as_ref()
                         .map(Self::validated_constraints)
                         .transpose()?;
-                    Self::verify_persona_attestation(
+                    Self::verify_persona_dnssec(
                         &persona,
                         &new_operator_did,
                         dns_proof_hash,
                         challenge_nonce,
                         verification_expires_at,
-                        &attestor,
-                        &attestation_signature,
+                        challenge_expires_at,
+                        &dnssec_proof,
+                        b"transfer_persona", &[0; 32],
                     )?;
                     let acceptance = PersonaTransferAcceptancePayload::<T> {
                         domain: BoundedVec::truncate_from(
@@ -3698,6 +4022,7 @@ pub mod pallet {
                             scope: PolicyScopeV2::Persona(persona.clone()),
                         });
                     }
+                    Self::invalidate_policy_document(&PolicyScopeV3::Persona(persona.clone()));
                     PoliciesV3::<T>::remove(PolicyScopeV3::Persona(persona.clone()));
                     Self::deposit_event(Event::PersonaTransferred {
                         persona,
@@ -3888,6 +4213,8 @@ pub mod pallet {
             persona: Option<&[u8]>,
             tag: Option<&[u8]>,
         ) -> Option<ResolvedDeliveryPolicy<T>> {
+            assert!(!Self::has_policy_document_override(recipient, persona),
+                "OpaquePolicyRequiresOffchainResolution");
             let recipient = Self::did_from_slice(recipient)?;
             let tag = match tag {
                 Some(raw) => {
@@ -4036,20 +4363,13 @@ pub mod pallet {
                                     recipient_did: recipient_did.into_inner(),
                                     payload_template: payload_template.into_inner(),
                                 },
-                                DeliveryStepOperation::Call {
-                                    service_did,
-                                    service_id,
-                                    registered_domain,
-                                    payload_template,
-                                } => DeliveryStepOperationView::Call {
-                                    service_did: service_did.into_inner(),
-                                    service_id: service_id.into_inner(),
-                                    registered_domain: registered_domain.into_inner(),
-                                    payload_template: payload_template.into_inner(),
-                                },
-                                DeliveryStepOperation::RequireProfile => {
-                                    DeliveryStepOperationView::RequireProfile
-                                }
+                                DeliveryStepOperation::Call { url, payload_template } =>
+                                    DeliveryStepOperationView::Call {
+                                        url: url.into_inner(),
+                                        payload_template: payload_template.into_inner(),
+                                    },
+                                DeliveryStepOperation::RequireProfile =>
+                                    DeliveryStepOperationView::RequireProfile,
                             },
                         })
                         .collect(),

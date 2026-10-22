@@ -8,14 +8,17 @@ homepage.workspace = true
 publish = false
 
 [dependencies]
+frame-benchmarking = { workspace = true, optional = true }
 codec = { workspace = true, features = ["derive"] }
 frame-support = { workspace = true }
 frame-system = { workspace = true }
 pallet-delivery-policy = { workspace = true }
+pallet-timestamp = { workspace = true }
 scale-info = { workspace = true, features = ["derive"] }
 sp-runtime = { workspace = true, default-features = false }
 
 [dev-dependencies]
+sp-core = { workspace = true, features = ["std"] }
 sp-io = { workspace = true, features = ["std"] }
 
 [features]
@@ -23,8 +26,10 @@ default = ["std"]
 std = [
     "codec/std",
     "frame-support/std",
+    "frame-benchmarking?/std",
     "frame-system/std",
     "pallet-delivery-policy/std",
+    "pallet-timestamp/std",
     "scale-info/std",
     "sp-runtime/std",
 ]
@@ -34,3 +39,5 @@ try-runtime = [
     "pallet-delivery-policy/try-runtime",
     "sp-runtime/try-runtime",
 ]
+
+runtime-benchmarks = ["frame-benchmarking/runtime-benchmarks", "frame-system/runtime-benchmarks", "frame-support/runtime-benchmarks", "pallet-timestamp/runtime-benchmarks"]

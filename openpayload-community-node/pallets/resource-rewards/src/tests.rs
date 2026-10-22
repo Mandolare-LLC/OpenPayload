@@ -43,16 +43,19 @@ fn policy(ttl: u64, burn: Balance) -> Policy<Test> {
 }
 
 fn registration_signature(pair: &ed25519::Pair, did: &[u8], timestamp: &[u8]) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(did);
-    payload.push(b'|');
-    payload.extend_from_slice(timestamp);
+    let payload = pallet_did_registry::registration_payload(
+        did,
+        None,
+        &pair.public().to_raw_vec(),
+        &[],
+        timestamp,
+    );
     pair.sign(&payload).to_raw_vec()
 }
 
 fn register_did(raw_did: &[u8], seed: u8) {
     let pair = ed25519::Pair::from_seed(&[seed; 32]);
-    let timestamp = b"0".to_vec();
+    let timestamp = b"v2:0:60000".to_vec();
     let signature = registration_signature(&pair, raw_did, &timestamp);
     assert_ok!(DidRegistry::register_with_proof(
         RuntimeOrigin::signed(1),
@@ -74,7 +77,7 @@ fn sig(seed: u8) -> Vec<u8> {
 
 fn register_operator(account: AccountId, did: &[u8]) {
     let root = ed25519::Pair::from_seed(&[account as u8; 32]);
-    let timestamp = b"0".to_vec();
+    let timestamp = b"v2:0:60000".to_vec();
     let registration_signature = registration_signature(&root, did, &timestamp);
     assert_ok!(DidRegistry::register_with_proof(
         RuntimeOrigin::signed(account),
@@ -258,7 +261,7 @@ fn did_policy_registration_and_cache_policy_lookup_remain_method_agnostic() {
                 b"did:openpayload:tag1work11111111".to_vec(),
                 policy(50, 5),
             ),
-            DeliveryPolicyError::<Test>::LegacyPolicyDeprecated
+            DeliveryPolicyError::<Test>::LegacyPolicyWriteDisabled
         );
         assert_noop!(
             DeliveryPolicy::set_persona_policy(
@@ -308,7 +311,7 @@ fn operator_registration_requires_an_active_did_root_authorization() {
         );
 
         let root = ed25519::Pair::from_seed(&[7; 32]);
-        let timestamp = b"0".to_vec();
+        let timestamp = b"v2:0:60000".to_vec();
         assert_ok!(DidRegistry::register_with_proof(
             RuntimeOrigin::signed(account),
             raw_did.to_vec(),
@@ -368,7 +371,7 @@ fn deactivated_did_cannot_be_bound_to_an_operator() {
         let raw_did = b"did:openpayload:operator1inactive16";
         let bond = Some(100);
         let root = ed25519::Pair::from_seed(&[6; 32]);
-        let timestamp = b"0".to_vec();
+        let timestamp = b"v2:0:60000".to_vec();
         assert_ok!(DidRegistry::register_with_proof(
             RuntimeOrigin::signed(account),
             raw_did.to_vec(),

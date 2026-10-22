@@ -33,15 +33,21 @@ fn alternate_pair() -> ed25519::Pair {
 }
 
 fn registration_signature(pair: &ed25519::Pair, raw_did: &[u8], timestamp: &[u8]) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(raw_did);
-    payload.push(b'|');
-    payload.extend_from_slice(timestamp);
-    pair.sign(&payload).to_raw_vec()
+    pair.sign(&crate::registration_payload(
+        raw_did,
+        None,
+        &pair.public().to_raw_vec(),
+        &[],
+        timestamp,
+    ))
+    .to_raw_vec()
 }
 
 fn register_with_root(raw_did: &[u8], pair: &ed25519::Pair) {
-    let timestamp = b"0".to_vec();
+    if Timestamp::get() == 0 {
+        Timestamp::set_timestamp(NOW_MILLIS);
+    }
+    let timestamp = format!("v2:0:{}", NOW_MILLIS + 60_000).into_bytes();
     let signature = registration_signature(pair, raw_did, &timestamp);
     assert_ok!(DidRegistry::register_with_proof(
         RuntimeOrigin::signed(1),
@@ -53,11 +59,33 @@ fn register_with_root(raw_did: &[u8], pair: &ed25519::Pair) {
     ));
 }
 
+fn install_signing_key(raw_did: &[u8], raw_id: &[u8], pair: &ed25519::Pair) {
+    Dids::<Test>::mutate(did(raw_did), |record| {
+        let record = record.as_mut().unwrap();
+        let doc = record
+            .document
+            .get_or_insert_with(|| crate::DidDocument::<Test> {
+                id: did(raw_did),
+                verification_method: Default::default(),
+                authentication: None,
+                key_agreement: Default::default(),
+                service: None,
+            });
+        doc.verification_method
+            .try_push(verification_method_with_key(
+                raw_id,
+                raw_did,
+                multibase_ed25519_public_key(pair),
+            ))
+            .unwrap();
+    });
+}
+
 #[test]
-fn registration_accepts_operator_selected_platforms_with_base58_addresses() {
+fn registration_accepts_openpayload_method_with_base58_addresses() {
     new_test_ext().execute_with(|| {
         let pair = root_pair();
-        let raw_did = b"did:research:L5bBGBeKawAN2JtBv9rEzP";
+        let raw_did = b"did:openpayload:L5bBGBeKawAN2JtBv9rEzP";
 
         register_with_root(raw_did, &pair);
 
@@ -70,6 +98,8 @@ fn registration_rejects_noncanonical_dids() {
     new_test_ext().execute_with(|| {
         let pair = root_pair();
         let invalid_dids: Vec<Vec<u8>> = vec![
+            b"did:talaria:L5bBGBeKawAN2JtBv9rEzP".to_vec(),
+            b"did:research:L5bBGBeKawAN2JtBv9rEzP".to_vec(),
             b"openpayload:L5bBGBeKawAN2JtBv9rEzP".to_vec(),
             b"did:OpenPayload:L5bBGBeKawAN2JtBv9rEzP".to_vec(),
             b"did:openpayload:device:L5bBGBeKawAN2JtBv9rEzP".to_vec(),
@@ -80,7 +110,7 @@ fn registration_rejects_noncanonical_dids() {
         ];
 
         for raw_did in invalid_dids {
-            let timestamp = b"0".to_vec();
+            let timestamp = format!("v2:0:{}", NOW_MILLIS + 60_000).into_bytes();
             let signature = registration_signature(&pair, &raw_did, &timestamp);
             assert_noop!(
                 DidRegistry::register_with_proof(
@@ -94,6 +124,28 @@ fn registration_rejects_noncanonical_dids() {
                 Error::<Test>::InvalidDidFormat
             );
         }
+    });
+}
+
+#[test]
+fn stored_legacy_identity_cannot_authorize_policy_or_registry_operations() {
+    new_test_ext().execute_with(|| {
+        let current = b"did:openpayload:L5bBGBeKawAN2JtBv9rEzP";
+        let legacy = b"did:talaria:L5bBGBeKawAN2JtBv9rEzP";
+        let pair = root_pair();
+        register_with_root(current, &pair);
+        let record = Dids::<Test>::take(did(current)).unwrap();
+        // Simulate a record left in storage by an earlier runtime. No aliasing or migration.
+        Dids::<Test>::insert(did(legacy), record);
+        assert!(!DidRegistry::did_exists(legacy));
+        assert_eq!(DidRegistry::owner_of(legacy), None);
+        assert!(!DidRegistry::can_update_did(&1, legacy));
+        assert!(!<DidRegistry as pallet_delivery_policy::DidProvider<u64>>::did_exists(legacy));
+        assert!(!<DidRegistry as pallet_delivery_policy::DidProvider<u64>>::verify_did_signature(
+            legacy, b"root", b"policy", &pair.sign(b"policy").to_raw_vec()
+        ));
+        assert_noop!(DidRegistry::set_alias(RuntimeOrigin::signed(1), legacy.to_vec(), b"old-phone".to_vec()),
+            Error::<Test>::InvalidDidFormat);
     });
 }
 
@@ -169,7 +221,9 @@ fn verification_method(raw_id: &[u8], raw_did: &[u8], seed: u8) -> VerificationM
         id: id(raw_id),
         type_: b"Ed25519VerificationKey2020".to_vec().try_into().unwrap(),
         controller: id(raw_did),
-        public_key_multibase: vec![seed; 32].try_into().unwrap(),
+        public_key_multibase: multibase_ed25519_public_key(&ed25519::Pair::from_seed(&[seed; 32]))
+            .try_into()
+            .unwrap(),
     }
 }
 
@@ -459,7 +513,7 @@ fn device_crud_supports_create_read_update_tombstone_restore_and_remove() {
             b"device-b".to_vec(),
         ));
         assert!(DidRegistry::device_of(raw_did, b"device-b").is_none());
-        assert!(DidRegistry::devices_of(raw_did).is_none());
+        assert!(DidRegistry::device_of(raw_did, b"missing").is_none());
     });
 }
 
@@ -591,7 +645,7 @@ fn update_root_pubkey_succeeds_and_updates_record_timestamp() {
             .updated_at;
         Timestamp::set_timestamp(before + 10);
 
-        let new_root = vec![42u8; 32];
+        let new_root = ed25519::Pair::from_seed(&[42; 32]).public().to_raw_vec();
         let (payload, signature) = signed_root_pubkey_payload(
             &pair,
             root_pubkey_payload(b"did:openpayload:entity1root1rotate", new_root.clone(), 0),
@@ -1047,6 +1101,11 @@ fn add_service_with_authorization_and_priority_succeeds() {
     new_test_ext().execute_with(|| {
         let pair = root_pair();
         register_with_root(b"did:openpayload:entity1svc111111", &pair);
+        install_signing_key(
+            b"did:openpayload:entity1svc111111",
+            b"did:openpayload:entity1svc111111#keys-1",
+            &pair,
+        );
         let svc = service(
             b"did:openpayload:entity1svc111111#cache",
             b"OpenPayloadCacheService",
@@ -1112,6 +1171,11 @@ fn update_service_with_authorization_and_priority_succeeds() {
     new_test_ext().execute_with(|| {
         let pair = root_pair();
         register_with_root(b"did:openpayload:entity1svc111211", &pair);
+        install_signing_key(
+            b"did:openpayload:entity1svc111211",
+            b"did:openpayload:entity1svc111211#keys-1",
+            &pair,
+        );
         let svc = service(
             b"did:openpayload:entity1svc111211#relay",
             b"OpenPayloadRelayService",
@@ -1186,7 +1250,7 @@ fn legacy_service_without_authorization_or_priority_still_succeeds() {
         register_with_root(b"did:openpayload:entity1svc111311", &pair);
         let svc = service(
             b"did:openpayload:entity1svc111311#directory",
-            b"OpenPayloadDirectory",
+            b"DirectoryService",
             b"https://directory.example",
             None,
             None,
@@ -1211,7 +1275,7 @@ fn legacy_service_without_authorization_or_priority_still_succeeds() {
 
         let updated = service(
             b"did:openpayload:entity1svc111311#directory",
-            b"OpenPayloadDirectory",
+            b"DirectoryService",
             b"https://directory-2.example",
             None,
             None,
@@ -1245,7 +1309,7 @@ fn legacy_service_without_authorization_or_priority_still_succeeds() {
 }
 
 #[test]
-fn service_with_max_authorization_keys_is_accepted() {
+fn service_authorization_rejects_dangling_keys_even_within_byte_bounds() {
     new_test_ext().execute_with(|| {
         let pair = root_pair();
         register_with_root(b"did:openpayload:entity1svc111411", &pair);
@@ -1276,26 +1340,20 @@ fn service_with_max_authorization_keys_is_accepted() {
             ),
         );
 
-        assert_ok!(DidRegistry::add_service(
-            RuntimeOrigin::none(),
-            b"did:openpayload:entity1svc111411".to_vec(),
-            svc,
-            payload,
-            signature,
-            b"root".to_vec(),
-        ));
-
-        let doc = Dids::<Test>::get(did(b"did:openpayload:entity1svc111411"))
-            .unwrap()
-            .document
-            .unwrap();
+        assert_noop!(
+            DidRegistry::add_service(
+                RuntimeOrigin::none(),
+                b"did:openpayload:entity1svc111411".to_vec(),
+                svc,
+                payload,
+                signature,
+                b"root".to_vec()
+            ),
+            Error::<Test>::InvalidDocument
+        );
         assert_eq!(
-            doc.service.unwrap()[0]
-                .authorization
-                .as_ref()
-                .unwrap()
-                .len() as u32,
-            max_service_authorization_keys()
+            DocumentNonces::<Test>::get(did(b"did:openpayload:entity1svc111411")),
+            0
         );
     });
 }
@@ -1490,7 +1548,7 @@ fn authorization_expiry_uses_epoch_millis_timestamp() {
             0
         );
 
-        let new_root = vec![42u8; 32];
+        let new_root = ed25519::Pair::from_seed(&[42; 32]).public().to_raw_vec();
         let (payload, signature) = signed_root_pubkey_payload(
             &pair,
             root_pubkey_payload_until(
@@ -1564,7 +1622,7 @@ fn future_epoch_millis_payload_is_accepted_and_increments_nonce_after_success() 
             1
         );
 
-        let new_root = vec![23u8; 32];
+        let new_root = ed25519::Pair::from_seed(&[23; 32]).public().to_raw_vec();
         let (payload, signature) = signed_root_pubkey_payload(
             &pair,
             root_pubkey_payload(b"did:openpayload:entity1future111", new_root.clone(), 0),
@@ -1620,7 +1678,7 @@ fn did_registry_call_indices_remain_unchanged() {
         };
         let service = Service::<Test> {
             id: id(b"did:openpayload:entity1index1111#svc"),
-            type_: b"OpenPayloadDirectory".to_vec().try_into().unwrap(),
+            type_: b"DirectoryService".to_vec().try_into().unwrap(),
             service_endpoint: vec![b"https://directory.example".to_vec().try_into().unwrap()]
                 .try_into()
                 .unwrap(),
@@ -1874,22 +1932,34 @@ fn non_root_signer_accepts_base58btc_multibase_public_key() {
             b"root".to_vec(),
         ));
 
+        Dids::<Test>::mutate(did(raw_did), |r| {
+            r.as_mut()
+                .unwrap()
+                .document
+                .as_mut()
+                .unwrap()
+                .authentication = Some(vec![id(signer_id)].try_into().unwrap());
+        });
         let (payload, signature) = signed_document_payload(
             &device,
             document_payload_until(
-                DocumentAction::AddAuthentication,
+                DocumentAction::UpdateVerificationMethod,
                 raw_did,
+                Some(verification_method_with_key(
+                    signer_id,
+                    raw_did,
+                    multibase_ed25519_public_key(&device),
+                )),
                 None,
-                Some(signer_id),
                 1,
                 FUTURE_MILLIS,
                 signer_id,
             ),
         );
-        assert_ok!(DidRegistry::add_authentication(
+        assert_ok!(DidRegistry::update_verification_method(
             RuntimeOrigin::none(),
             raw_did.to_vec(),
-            signer_id.to_vec(),
+            verification_method_with_key(signer_id, raw_did, multibase_ed25519_public_key(&device)),
             payload,
             signature,
             signer_id.to_vec(),
@@ -1963,7 +2033,13 @@ fn control_proof_manages_devices_without_using_account_owner_origin() {
         ));
 
         let record = Dids::<Test>::get(did(raw_did)).unwrap();
-        assert_eq!(record.devices.unwrap()[0].device_id, device_id);
+        assert!(record.devices.is_none());
+        assert_eq!(
+            DidRegistry::device_of(raw_did, &device_id)
+                .unwrap()
+                .device_id,
+            device_id
+        );
         assert_eq!(ControlNonces::<Test>::get(did(raw_did)), 1);
     });
 }
@@ -2122,5 +2198,591 @@ fn control_proof_rejects_replay_and_invalid_signer() {
             ),
             Error::<Test>::DidDeactivated
         );
+    });
+}
+
+fn security_document(raw_did: &[u8], pair: &ed25519::Pair) -> crate::DidDocument<Test> {
+    crate::DidDocument {
+        id: did(raw_did),
+        verification_method: vec![verification_method_with_key(
+            b"#root",
+            raw_did,
+            multibase_ed25519_public_key(pair),
+        )]
+        .try_into()
+        .unwrap(),
+        authentication: Some(vec![id(b"#root")].try_into().unwrap()),
+        key_agreement: Default::default(),
+        service: None,
+    }
+}
+
+#[test]
+fn registration_v2_binds_document_alias_and_expiry() {
+    new_test_ext().execute_with(|| {
+        Timestamp::set_timestamp(NOW_MILLIS);
+        let pair = root_pair();
+        let raw_did = b"did:openpayload:1111111111111111111111";
+        let doc = security_document(raw_did, &pair).encode();
+        let timestamp = format!("v2:0:{FUTURE_MILLIS}").into_bytes();
+        let signature = pair
+            .sign(&crate::registration_payload(
+                raw_did,
+                Some(b"reviewed"),
+                &pair.public().to_raw_vec(),
+                &doc,
+                &timestamp,
+            ))
+            .to_raw_vec();
+        assert_noop!(
+            DidRegistry::register_with_document_proof(
+                RuntimeOrigin::none(),
+                raw_did.to_vec(),
+                Some(b"altered".to_vec()),
+                timestamp.clone(),
+                pair.public().to_raw_vec(),
+                signature.clone(),
+                doc.clone()
+            ),
+            Error::<Test>::InvalidSignature
+        );
+        let mut tampered = doc.clone();
+        tampered.push(0);
+        assert_noop!(
+            DidRegistry::register_with_document_proof(
+                RuntimeOrigin::none(),
+                raw_did.to_vec(),
+                Some(b"reviewed".to_vec()),
+                timestamp.clone(),
+                pair.public().to_raw_vec(),
+                signature.clone(),
+                tampered
+            ),
+            Error::<Test>::InvalidSignature
+        );
+        assert_ok!(DidRegistry::register_with_document_proof(
+            RuntimeOrigin::none(),
+            raw_did.to_vec(),
+            Some(b"reviewed".to_vec()),
+            timestamp,
+            pair.public().to_raw_vec(),
+            signature,
+            doc
+        ));
+    });
+}
+
+#[test]
+fn replacement_consumes_nonce_and_rejects_trailing_bytes() {
+    new_test_ext().execute_with(|| {
+        let pair = root_pair();
+        let raw_did = b"did:openpayload:1111111111111111111111";
+        register_with_root(raw_did, &pair);
+        let blob = security_document(raw_did, &pair).encode();
+        let timestamp = format!("v2:0:{FUTURE_MILLIS}").into_bytes();
+        let sign = |doc: &[u8]| {
+            let mut payload = b"openpayload:set_document:v2|".to_vec();
+            payload.extend(raw_did);
+            payload.push(b'|');
+            payload.extend(sp_io::hashing::blake2_256(doc));
+            payload.push(b'|');
+            payload.extend(&timestamp);
+            pair.sign(&payload).to_raw_vec()
+        };
+        let mut trailing = blob.clone();
+        trailing.push(0);
+        assert_noop!(
+            DidRegistry::set_document_with_proof(
+                RuntimeOrigin::none(),
+                raw_did.to_vec(),
+                trailing.clone(),
+                timestamp.clone(),
+                pair.public().to_raw_vec(),
+                sign(&trailing)
+            ),
+            Error::<Test>::InvalidDocument
+        );
+        assert_ok!(DidRegistry::set_document_with_proof(
+            RuntimeOrigin::none(),
+            raw_did.to_vec(),
+            blob.clone(),
+            timestamp.clone(),
+            pair.public().to_raw_vec(),
+            sign(&blob)
+        ));
+        assert_noop!(
+            DidRegistry::set_document_with_proof(
+                RuntimeOrigin::none(),
+                raw_did.to_vec(),
+                blob.clone(),
+                timestamp.clone(),
+                pair.public().to_raw_vec(),
+                sign(&blob)
+            ),
+            Error::<Test>::InvalidDocumentNonce
+        );
+        assert_eq!(DocumentNonces::<Test>::get(did(raw_did)), 1);
+    });
+}
+
+#[test]
+fn malformed_keys_reserved_names_and_protected_endpoints_are_rejected() {
+    new_test_ext().execute_with(|| {
+        let pair = root_pair();
+        let raw_did = b"did:openpayload:1111111111111111111111";
+        register_with_root(raw_did, &pair);
+        for (kind, key) in [
+            (
+                b"<script>alert(1)</script>".as_slice(),
+                b"not-a-key".as_slice(),
+            ),
+            (b"CustomKeySuite", b"malformed key with whitespace"),
+            (b"CustomKeySuite", b"<script>key</script>"),
+        ] {
+            let mut method = verification_method_with_key(b"#key", raw_did, key.to_vec());
+            method.type_ = kind.to_vec().try_into().unwrap();
+            let (payload, signature) = signed_document_payload(
+                &pair,
+                document_payload(
+                    DocumentAction::AddVerificationMethod,
+                    raw_did,
+                    Some(method.clone()),
+                    None,
+                    0,
+                ),
+            );
+            assert_noop!(
+                DidRegistry::add_verification_method(
+                    RuntimeOrigin::none(),
+                    raw_did.to_vec(),
+                    method,
+                    payload,
+                    signature,
+                    b"root".to_vec()
+                ),
+                Error::<Test>::InvalidDocument
+            );
+        }
+        for (kind, endpoint) in [
+            (
+                b"myOpenPayloadOverlay".as_slice(),
+                b"https://relay.example".as_slice(),
+            ),
+            (b"openpayloadcacheservice", b"https://cache.example"),
+            (b"OpenPayloadRelayService", b"javascript:alert(1)"),
+            (
+                b"OpenPayloadCacheService",
+                b"https://user:pass@cache.example",
+            ),
+            (b"OpenPayloadCacheService", b"http://cache.example"),
+        ] {
+            let svc = service(b"#service", kind, endpoint, None, None);
+            let (payload, signature) = signed_document_payload(
+                &pair,
+                document_service_payload(DocumentAction::AddService, raw_did, svc.clone(), 0),
+            );
+            assert_noop!(
+                DidRegistry::add_service(
+                    RuntimeOrigin::none(),
+                    raw_did.to_vec(),
+                    svc,
+                    payload,
+                    signature,
+                    b"root".to_vec()
+                ),
+                Error::<Test>::InvalidDocument
+            );
+        }
+        assert_eq!(DocumentNonces::<Test>::get(did(raw_did)), 0);
+    });
+}
+
+#[test]
+fn overlay_envelope_preserves_data_but_cannot_claim_core_service_privileges() {
+    new_test_ext().execute_with(|| {
+        let pair = root_pair(); let raw_did = b"did:openpayload:1111111111111111111111";
+        register_with_root(raw_did, &pair);
+        let json = br##"{"id":"#overlay","type":["OverlayService","LinkedDomains"],"serviceEndpoint":{"uri":"ipfs://content","nested":{"script":"<script>alert(1)</script>"}},"authorization":{"app":"custom"},"priority":"custom"}"##;
+        let encoded = [crate::input::OVERLAY_PREFIX, json].concat();
+        let svc = service(b"#overlay", b"OverlayService", &encoded, None, None);
+        let (payload, signature) = signed_document_payload(&pair, document_service_payload(DocumentAction::AddService, raw_did, svc.clone(), 0));
+        assert_ok!(DidRegistry::add_service(RuntimeOrigin::none(), raw_did.to_vec(), svc, payload, signature, b"root".to_vec()));
+        assert_eq!(Dids::<Test>::get(did(raw_did)).unwrap().document.unwrap().service.unwrap()[0].service_endpoint[0].as_slice(), encoded.as_slice());
+        assert!(!<DidRegistry as pallet_delivery_policy::DidProvider<u64>>::service_supports_delivery(raw_did, b"#overlay", pallet_delivery_policy::DeliveryServiceKind::Cache));
+        for json in [br##"{"id":"#overlay","id":"#evil","type":"OverlayService","serviceEndpoint":{}}"##.as_slice(),
+            br##"{"id":"#overlay","type":["OverlayService","OpenPayloadCacheService"],"serviceEndpoint":{}}"##,
+            br##"{"id":"#other","type":"OverlayService","serviceEndpoint":{}}"##] {
+            let data = [crate::input::OVERLAY_PREFIX, json].concat();
+            assert!(!crate::input::overlay(&data, b"#overlay", b"OverlayService"));
+        }
+    });
+}
+
+#[test]
+fn unauthenticated_published_key_cannot_manage_document() {
+    new_test_ext().execute_with(|| {
+        let root = root_pair();
+        let device = alternate_pair();
+        let raw_did = b"did:openpayload:1111111111111111111111";
+        register_with_root(raw_did, &root);
+        install_signing_key(raw_did, b"#device", &device);
+        let payload = document_payload_until(
+            DocumentAction::RemoveVerificationMethod,
+            raw_did,
+            None,
+            Some(b"#device"),
+            0,
+            FUTURE_MILLIS,
+            b"#device",
+        );
+        let (payload, signature) = signed_document_payload(&device, payload);
+        assert_noop!(
+            DidRegistry::remove_verification_method(
+                RuntimeOrigin::none(),
+                raw_did.to_vec(),
+                b"#device".to_vec(),
+                payload,
+                signature,
+                b"#device".to_vec()
+            ),
+            Error::<Test>::InvalidSignature
+        );
+    });
+}
+
+#[test]
+fn published_key_suites_are_open_but_cannot_impersonate_record_signers() {
+    new_test_ext().execute_with(|| {
+        let root = root_pair(); let device = ed25519::Pair::from_seed(&[35;32]);
+        let raw_did = b"did:openpayload:1111111111111111111111";
+        register_with_root(raw_did, &root);
+        let json = br##"{"id":"#custom","type":"ApplicationKeySuite","controller":"did:example:owner","publicKeyJwk":{"kty":"CUSTOM","custom":[1,2]},"extension":{"script":"<script>opaque</script>"}}"##;
+        let material = [crate::input::KEY_PREFIX,json].concat();
+        let mut method = verification_method_with_key(b"#custom", b"did:example:owner", material.clone());
+        method.type_ = b"ApplicationKeySuite".to_vec().try_into().unwrap();
+        let (payload, signature) = signed_document_payload(&root, document_payload(DocumentAction::AddVerificationMethod, raw_did, Some(method.clone()), None, 0));
+        assert_ok!(DidRegistry::add_verification_method(RuntimeOrigin::none(), raw_did.to_vec(), method, payload, signature, b"root".to_vec()));
+        assert_eq!(Dids::<Test>::get(did(raw_did)).unwrap().document.unwrap().verification_method[0].public_key_multibase.as_slice(), material.as_slice());
+        let svc = service(b"#cache", b"OpenPayloadCacheService", b"https://cache.example", Some(vec![b"#custom"]), None);
+        let (payload, signature) = signed_document_payload(&root, document_service_payload(DocumentAction::AddService, raw_did, svc.clone(), 1));
+        assert_noop!(DidRegistry::add_service(RuntimeOrigin::none(), raw_did.to_vec(), svc, payload, signature, b"root".to_vec()), Error::<Test>::InvalidDocument);
+        // Even valid Ed25519 bytes do not give an application suite platform authority.
+        Dids::<Test>::mutate(did(raw_did), |r| {
+            let doc = r.as_mut().unwrap().document.as_mut().unwrap();
+            doc.verification_method[0].controller = raw_did.to_vec().try_into().unwrap();
+            doc.verification_method[0].public_key_multibase = multibase_ed25519_public_key(&device).try_into().unwrap();
+            doc.authentication = Some(vec![b"#custom".to_vec().try_into().unwrap()].try_into().unwrap());
+        });
+        let next = verification_method(b"#other", raw_did, 27);
+        let (payload, signature) = signed_document_payload(&device, document_payload_until(DocumentAction::AddVerificationMethod,raw_did,Some(next.clone()),None,1,FUTURE_MILLIS,b"#custom"));
+        assert_noop!(DidRegistry::add_verification_method(RuntimeOrigin::none(),raw_did.to_vec(),next,payload,signature,b"#custom".to_vec()), Error::<Test>::InvalidSignature);
+    });
+}
+
+#[test]
+fn registration_encoding_matches_directory_golden_vector() {
+    let key: Vec<u8> = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+        .as_bytes()
+        .chunks(2)
+        .map(|v| u8::from_str_radix(core::str::from_utf8(v).unwrap(), 16).unwrap())
+        .collect();
+    let encoded = crate::registration_payload(
+        b"did:openpayload:1111111111111111111111",
+        Some(b"alice"),
+        &key,
+        &[1, 2, 3],
+        b"v2:7:1001",
+    );
+    let hex = encoded
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    assert_eq!(hex,"6f70656e7061796c6f61643a72656769737465723a76327c986469643a6f70656e7061796c6f61643a313131313131313131313131313131313131313131310114616c69636580d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a11c0e79b71c3976ccd0c02d1310e2516c08edc9d8b6f57ccd680d63a4d8e72da2476323a373a31303031");
+}
+
+#[test]
+fn bounded_overlay_json_rejects_duplicate_names_and_numeric_ambiguity() {
+    assert!(crate::input::bounded_json(br#"{"x":18446744073709551616}"#).is_none());
+    assert!(crate::input::bounded_json(br#"{"x":1,"x":2}"#).is_none());
+    assert!(crate::input::bounded_json(br#"{"x":1e999}"#).is_none());
+    assert!(crate::input::bounded_json(
+        br#"{"x":18446744073709551615,"opaque":"<script>data</script>"}"#
+    )
+    .is_some());
+}
+
+#[test]
+fn lifecycle_pool_checks_signatures_and_shares_nonce_with_document_patches() {
+    new_test_ext().execute_with(|| {
+        let pair = root_pair();
+        let raw_did = b"did:openpayload:1111111111111111111111";
+        register_with_root(raw_did, &pair);
+        let blob = security_document(raw_did, &pair).encode();
+        let timestamp = format!("v2:0:{FUTURE_MILLIS}").into_bytes();
+        let bytes = [
+            b"openpayload:set_document:v2|".as_slice(),
+            raw_did,
+            b"|",
+            &sp_io::hashing::blake2_256(&blob),
+            b"|",
+            &timestamp,
+        ]
+        .concat();
+        let call = crate::Call::<Test>::set_document_with_proof {
+            did: raw_did.to_vec(),
+            doc_blob: blob.clone(),
+            timestamp: timestamp.clone(),
+            pubkey: pair.public().to_raw_vec(),
+            signature: pair.sign(&bytes).0.to_vec(),
+        };
+        let replacement = DidRegistry::validate_unsigned_call(&call).unwrap();
+        let bad = crate::Call::<Test>::set_document_with_proof {
+            did: raw_did.to_vec(),
+            doc_blob: blob,
+            timestamp,
+            pubkey: pair.public().to_raw_vec(),
+            signature: vec![0; 64],
+        };
+        assert!(DidRegistry::validate_unsigned_call(&bad).is_err());
+        let method = verification_method(b"#key", raw_did, 9);
+        let (signed_payload, signature) = signed_document_payload(
+            &pair,
+            document_payload(
+                DocumentAction::AddVerificationMethod,
+                raw_did,
+                Some(method.clone()),
+                None,
+                0,
+            ),
+        );
+        let patch = crate::Call::<Test>::add_verification_method {
+            did: raw_did.to_vec(),
+            method,
+            signed_payload,
+            signature,
+            signer_key_id: b"root".to_vec(),
+        };
+        assert_eq!(
+            replacement.provides,
+            DidRegistry::validate_unsigned_call(&patch)
+                .unwrap()
+                .provides
+        );
+    });
+}
+
+fn device_action(
+    pair: &ed25519::Pair,
+    raw: &[u8],
+    action: ControlAction<Test>,
+) -> frame_support::dispatch::DispatchResult {
+    let nonce = ControlNonces::<Test>::get(did(raw));
+    let (payload, sig) = signed_control_payload(pair, raw, action, nonce);
+    DidRegistry::apply_control_with_proof(RuntimeOrigin::none(), payload, sig, b"root".to_vec())
+}
+
+#[test]
+fn hundreds_of_devices_do_not_expand_or_consume_verification_slots_in_did_record() {
+    new_test_ext().execute_with(|| {
+        let raw = b"did:openpayload:1111111111111111";
+        let pair = root_pair();
+        register_with_root(raw, &pair);
+        let before = Dids::<Test>::get(did(raw)).unwrap().encode();
+        for n in 0..500 {
+            assert_ok!(device_action(
+                &pair,
+                raw,
+                ControlAction::AddDevice {
+                    device_id: format!("sensor-{n}").into_bytes().try_into().unwrap()
+                }
+            ));
+        }
+        assert_eq!(
+            crate::Devices::<Test>::iter_key_prefix(did(raw)).count(),
+            500
+        );
+        assert_eq!(Dids::<Test>::get(did(raw)).unwrap().encode(), before);
+        assert!(DidRegistry::device_of(raw, b"sensor-499").is_some());
+    });
+}
+
+#[test]
+fn legacy_devices_migrate_atomically_and_are_readable_before_the_first_write() {
+    new_test_ext().execute_with(|| {
+        let raw = b"did:openpayload:1111111111111111";
+        let pair = root_pair();
+        register_with_root(raw, &pair);
+        Dids::<Test>::mutate(did(raw), |r| {
+            r.as_mut().unwrap().devices = Some(
+                vec![crate::DeviceInfo {
+                    device_id: b"legacy".to_vec().try_into().unwrap(),
+                    added_at: 123,
+                    tombstoned: true,
+                }]
+                .try_into()
+                .unwrap(),
+            )
+        });
+        assert!(DidRegistry::device_of(raw, b"legacy").unwrap().tombstoned);
+        assert_ok!(device_action(
+            &pair,
+            raw,
+            ControlAction::AddDevice {
+                device_id: b"sensor".to_vec().try_into().unwrap()
+            }
+        ));
+        let legacy = DidRegistry::device_record(raw, b"legacy").unwrap();
+        assert_eq!(legacy.info.added_at, 123);
+        assert!(legacy.info.tombstoned);
+        assert!(legacy.key_agreement_override.is_none());
+        assert!(Dids::<Test>::get(did(raw)).unwrap().devices.is_none());
+        assert_eq!(crate::Devices::<Test>::iter_key_prefix(did(raw)).count(), 2);
+    });
+}
+
+#[test]
+fn device_override_has_only_active_and_rotation_and_preserves_did_document() {
+    new_test_ext().execute_with(|| {
+        let raw = b"did:openpayload:1111111111111111";
+        let pair = root_pair();
+        register_with_root(raw, &pair);
+        let id: DeviceIdOf = b"sensor".to_vec().try_into().unwrap();
+        assert_ok!(device_action(
+            &pair,
+            raw,
+            ControlAction::AddDevice {
+                device_id: id.clone()
+            }
+        ));
+        let key = |id: &[u8]| KeyAgreement::<Test> {
+            id: id.to_vec().try_into().unwrap(),
+            type_: b"X25519KeyAgreementKey2020".to_vec().try_into().unwrap(),
+            controller: raw.to_vec().try_into().unwrap(),
+            public_key_multibase: b"zExample".to_vec().try_into().unwrap(),
+        };
+        let keys = crate::DeviceKeyAgreementOverride::<Test> {
+            active: key(b"#active"),
+            rotation: Some(key(b"#rotation")),
+        };
+        let before = Dids::<Test>::get(did(raw)).unwrap().encode();
+        assert_ok!(device_action(
+            &pair,
+            raw,
+            ControlAction::SetDeviceKeyAgreement {
+                device_id: id.clone(),
+                key_agreement_override: Some(keys)
+            }
+        ));
+        let record = DidRegistry::device_record(raw, b"sensor").unwrap();
+        assert_eq!(
+            record.key_agreement_override.unwrap().active.id.as_slice(),
+            b"#active"
+        );
+        assert_eq!(Dids::<Test>::get(did(raw)).unwrap().encode(), before);
+        let duplicate = crate::DeviceKeyAgreementOverride::<Test> {
+            active: key(b"#active"),
+            rotation: Some(key(&[raw.as_slice(), b"#active"].concat())),
+        };
+        assert_noop!(
+            device_action(
+                &pair,
+                raw,
+                ControlAction::SetDeviceKeyAgreement {
+                    device_id: id.clone(),
+                    key_agreement_override: Some(duplicate)
+                }
+            ),
+            Error::<Test>::InvalidDeviceKeyAgreement
+        );
+        assert_ok!(device_action(
+            &pair,
+            raw,
+            ControlAction::SetDeviceKeyAgreement {
+                device_id: id,
+                key_agreement_override: None
+            }
+        ));
+        assert!(DidRegistry::device_record(raw, b"sensor")
+            .unwrap()
+            .key_agreement_override
+            .is_none());
+    });
+}
+
+#[test]
+fn did_deletion_invalidates_devices_immediately_and_cleans_only_a_bounded_batch() {
+    use frame_support::traits::Hooks;
+    new_test_ext().execute_with(|| {
+        let raw = b"did:openpayload:1111111111111111";
+        let pair = root_pair();
+        register_with_root(raw, &pair);
+        for n in 0..100 {
+            assert_ok!(device_action(
+                &pair,
+                raw,
+                ControlAction::AddDevice {
+                    device_id: format!("sensor-{n}").into_bytes().try_into().unwrap()
+                }
+            ));
+        }
+        assert_ok!(device_action(&pair, raw, ControlAction::DeleteDid));
+        assert!(DidRegistry::device_of(raw, b"sensor-1").is_none());
+        assert!(crate::PendingDeviceCleanup::<Test>::contains_key(did(raw)));
+        let count = || crate::Devices::<Test>::iter_key_prefix(did(raw)).count();
+        assert_eq!(count(), 100);
+        DidRegistry::on_idle(1, frame_support::weights::Weight::MAX);
+        assert_eq!(count(), 68);
+        for n in 2..5 {
+            DidRegistry::on_idle(n, frame_support::weights::Weight::MAX);
+        }
+        assert_eq!(count(), 0);
+        assert!(!crate::PendingDeviceCleanup::<Test>::contains_key(did(raw)));
+    });
+}
+
+#[test]
+fn sixty_four_published_agreement_keys_fit_and_a_sixty_fifth_is_rejected() {
+    new_test_ext().execute_with(|| {
+        let raw = b"did:openpayload:1111111111111111";
+        let pair = root_pair();
+        let mut doc = security_document(raw, &pair);
+        for n in 0..64 {
+            doc.key_agreement
+                .try_push(KeyAgreement::<Test> {
+                    id: format!("#purpose-{n}").into_bytes().try_into().unwrap(),
+                    type_: b"X25519KeyAgreementKey2020".to_vec().try_into().unwrap(),
+                    controller: raw.to_vec().try_into().unwrap(),
+                    public_key_multibase: vec![b'z'; 3800].try_into().unwrap(),
+                })
+                .unwrap();
+        }
+        assert!(doc.encode().len() > 16_384);
+        assert!(doc.encode().len() < <Test as crate::Config>::MaxDocLen::get() as usize);
+        assert_ok!(DidRegistry::validate_document_structure(&did(raw), &doc));
+        assert!(doc
+            .key_agreement
+            .try_push(doc.key_agreement[0].clone())
+            .is_err());
+    });
+}
+
+#[test]
+fn exhausted_control_nonce_cannot_replay_device_proofs() {
+    new_test_ext().execute_with(|| {
+        let raw = b"did:openpayload:1111111111111111";
+        let pair = root_pair();
+        register_with_root(raw, &pair);
+        ControlNonces::<Test>::insert(did(raw), u64::MAX);
+        assert_noop!(
+            device_action(
+                &pair,
+                raw,
+                ControlAction::AddDevice {
+                    device_id: b"sensor".to_vec().try_into().unwrap(),
+                }
+            ),
+            Error::<Test>::InvalidControlNonce
+        );
+        assert!(DidRegistry::device_of(raw, b"sensor").is_none());
     });
 }

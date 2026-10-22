@@ -91,10 +91,12 @@ parameter_types! {
 }
 
 impl pallet_did_registry::Config for Test {
+    #[cfg(feature = "runtime-benchmarks")]
+    type BenchmarkHelper = TestBenchmarkHelper;
     type PolicyCleanup = DeliveryPolicy;
     type RetirementGuard = ();
     type MaxDidLen = frame_support::traits::ConstU32<128>;
-    type MaxDevices = frame_support::traits::ConstU32<10>;
+    type MaxLegacyDevices = frame_support::traits::ConstU32<10>;
     type MaxAliasLen = frame_support::traits::ConstU32<64>;
     type MaxAliases = frame_support::traits::ConstU32<8>;
     type MaxContexts = frame_support::traits::ConstU32<4>;
@@ -120,11 +122,13 @@ impl pallet_did_registry::Config for Test {
 }
 
 impl pallet_delivery_policy::Config for Test {
+    type MaxPolicyDocumentBytes = frame_support::traits::ConstU32<65536>;
+    #[cfg(feature = "runtime-benchmarks")]
+    type BenchmarkHelper = ();
     type Balance = Balance;
     type DidProvider = DidRegistry;
     type ApplicationProvider = ();
-    type PersonaAttestationProvider = ();
-    type PersonaAttestorOrigin = frame_system::EnsureRoot<AccountId>;
+    type DnssecTrustAnchorOrigin = frame_system::EnsureRoot<AccountId>;
     type WeightInfo = ();
     type MaxDidLen = frame_support::traits::ConstU32<128>;
     type MaxTtl = MaxTtl;
@@ -275,4 +279,16 @@ pub fn new_test_ext_with_validators(
     .assimilate_storage(&mut storage)
     .unwrap();
     storage.into()
+}
+
+#[cfg(feature = "runtime-benchmarks")]
+impl pallet_did_registry::BenchmarkHelper for TestBenchmarkHelper {
+    fn public() -> Vec<u8> {
+        ed25519::Pair::from_seed(&[125; 32]).public().to_raw_vec()
+    }
+    fn sign(payload: &[u8]) -> Vec<u8> {
+        ed25519::Pair::from_seed(&[125; 32])
+            .sign(payload)
+            .to_raw_vec()
+    }
 }

@@ -133,7 +133,9 @@ fn admit_at<T: Config>(cache: &Actor<T>, sponsor: &T::AccountId, epoch: u64) {
     );
 }
 
-fn prepare_trigger<T: Config>() -> (Actor<T>, Actor<T>, u64, u32, ProofHashOf<T>, Vec<u8>, u32) {
+type TriggerPreparation<T> = (Actor<T>, Actor<T>, u64, u32, ProofHashOf<T>, Vec<u8>, u32);
+
+fn prepare_trigger<T: Config>() -> TriggerPreparation<T> {
     enable_rewards::<T>();
     let cache = install_actor::<T>("cache", 0, CACHE_SEED, NodeRole::Cache);
     let validator = install_actor::<T>("validator", 0, VALIDATOR_SEED, NodeRole::Validator);

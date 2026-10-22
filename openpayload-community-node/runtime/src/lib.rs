@@ -72,10 +72,10 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
     //   `spec_version`, and `authoring_version` are the same between Wasm and native.
     // This value is set to 100 to notify Polkadot-JS App (https://polkadot.js.org/apps) to use
     //   the compatible custom types.
-    spec_version: 123,
+    spec_version: 130,
     impl_version: 1,
     apis: apis::RUNTIME_API_VERSIONS,
-    transaction_version: 4,
+    transaction_version: 6,
     system_version: 1,
 };
 
@@ -274,6 +274,8 @@ impl pallet_authority_governance::Config for Runtime {
 }
 
 impl pallet_application_registry::Config for Runtime {
+    #[cfg(feature = "runtime-benchmarks")]
+    type BenchmarkHelper = ResourceRewardsBenchmarkHelper;
     type DidProvider = DidRegistry;
     type DomainProvider = RuntimeApplicationDomainProvider;
     type PolicyCleanup = RuntimeApplicationPolicyCleanup;
@@ -314,9 +316,9 @@ impl pallet_application_registry::ApplicationPolicyCleanup for RuntimeApplicatio
         else {
             return;
         };
-        pallet_delivery_policy::PoliciesV3::<Runtime>::remove(
-            pallet_delivery_policy::PolicyScopeV3::Application(id),
-        );
+        let scope = pallet_delivery_policy::PolicyScopeV3::Application(id);
+        DeliveryPolicy::invalidate_policy_document(&scope);
+        pallet_delivery_policy::PoliciesV3::<Runtime>::remove(scope);
     }
 }
 
@@ -332,10 +334,12 @@ impl pallet_did_registry::DidRetirementGuard for ApplicationControlDidGuard {
 }
 
 impl pallet_did_registry::Config for Runtime {
+    #[cfg(feature = "runtime-benchmarks")]
+    type BenchmarkHelper = ResourceRewardsBenchmarkHelper;
     type PolicyCleanup = DeliveryPolicy;
     type RetirementGuard = ApplicationControlDidGuard;
     type MaxDidLen = ConstU32<128>;
-    type MaxDevices = ConstU32<10>;
+    type MaxLegacyDevices = ConstU32<10>;
     type MaxAliasLen = ConstU32<64>;
     type MaxAliases = ConstU32<8>;
     type MaxContexts = ConstU32<4>;
@@ -344,16 +348,16 @@ impl pallet_did_registry::Config for Runtime {
     type MaxControllerRefs = ConstU32<4>;
     type MaxControllerLen = ConstU32<64>;
     type MaxVMs = ConstU32<5>;
-    type MaxKAs = ConstU32<5>;
+    type MaxKAs = ConstU32<64>;
     type MaxVMTypeLen = ConstU32<64>;
-    type MaxKeyMultibaseLen = ConstU32<128>;
+    type MaxKeyMultibaseLen = ConstU32<4096>;
     type MaxRefsPerRel = ConstU32<4>;
     type MaxServices = ConstU32<4>;
     type MaxServiceAuthorizationKeys = ConstU32<8>;
     type MaxServiceTypeLen = ConstU32<64>;
     type MaxServiceEndpointLen = ConstU32<128>;
-    type MaxServiceEndpointUrlLen = ConstU32<128>;
-    type MaxDocLen = ConstU32<16384>;
+    type MaxServiceEndpointUrlLen = ConstU32<4096>;
+    type MaxDocLen = ConstU32<327680>;
     type MaxKaTypeLen = ConstU32<64>;
     type MaxServiceEndpoints = ConstU32<5>;
     type MaxPolicyRefs = ConstU32<8>;
@@ -361,11 +365,13 @@ impl pallet_did_registry::Config for Runtime {
 }
 
 impl pallet_delivery_policy::Config for Runtime {
+    type MaxPolicyDocumentBytes = frame_support::traits::ConstU32<65536>;
+    #[cfg(feature = "runtime-benchmarks")]
+    type BenchmarkHelper = ResourceRewardsBenchmarkHelper;
     type Balance = Balance;
     type DidProvider = DidRegistry;
     type ApplicationProvider = RuntimeApplicationProvider;
-    type PersonaAttestationProvider = RuntimePersonaAttestationProvider;
-    type PersonaAttestorOrigin = frame_system::EnsureRoot<AccountId>;
+    type DnssecTrustAnchorOrigin = frame_system::EnsureRoot<AccountId>;
     type WeightInfo = pallet_delivery_policy::weights::SubstrateWeight<Runtime>;
     type MaxDidLen = ConstU32<128>;
     type MaxTtl = ConstU32<{ 30 * DAYS }>;
@@ -403,8 +409,14 @@ impl pallet_delivery_policy::ApplicationProvider for RuntimeApplicationProvider 
         )
         .ok()?;
         let record = pallet_application_registry::Applications::<Runtime>::get(id)?;
-        (record.status == pallet_application_registry::ApplicationStatus::Active)
-            .then(|| record.control_did.into_inner())
+        if record.status != pallet_application_registry::ApplicationStatus::Active
+            || !<DidRegistry as pallet_delivery_policy::DidProvider<AccountId>>::did_exists(
+                record.control_did.as_slice(),
+            )
+        {
+            return None;
+        }
+        Some(record.control_did.into_inner())
     }
 
     fn verified_domain(application_id: &[u8]) -> Option<Vec<u8>> {
@@ -414,7 +426,11 @@ impl pallet_delivery_policy::ApplicationProvider for RuntimeApplicationProvider 
         )
         .ok()?;
         let record = pallet_application_registry::Applications::<Runtime>::get(&id)?;
-        if record.status != pallet_application_registry::ApplicationStatus::Active {
+        if record.status != pallet_application_registry::ApplicationStatus::Active
+            || !<DidRegistry as pallet_delivery_policy::DidProvider<AccountId>>::did_exists(
+                record.control_did.as_slice(),
+            )
+        {
             return None;
         }
         let domain = pallet_application_registry::ApplicationDomains::<Runtime>::get(id)?;
@@ -443,20 +459,6 @@ impl pallet_delivery_policy::ApplicationProvider for RuntimeApplicationProvider 
         };
         pallet_application_registry::ApplicationLinkedDids::<Runtime>::get(id).contains(&did)
             && <DidRegistry as pallet_delivery_policy::DidProvider<AccountId>>::did_exists(target)
-    }
-}
-
-pub struct RuntimePersonaAttestationProvider;
-
-impl pallet_delivery_policy::PersonaAttestationProvider<AccountId>
-    for RuntimePersonaAttestationProvider
-{
-    fn verify_attestation(attestor: &AccountId, payload: &[u8], signature: &[u8]) -> bool {
-        use codec::Decode as _;
-        let Ok(signature) = Signature::decode(&mut &signature[..]) else {
-            return false;
-        };
-        signature.verify(payload, attestor)
     }
 }
 
@@ -517,6 +519,97 @@ impl pallet_resource_rewards::BenchmarkHelper<AccountId> for ResourceRewardsBenc
     }
 }
 
+#[cfg(feature = "runtime-benchmarks")]
+impl pallet_did_registry::BenchmarkHelper for ResourceRewardsBenchmarkHelper {
+    fn install_policy(did: &[u8]) {
+        seed_benchmark_policy(pallet_delivery_policy::PolicyScopeV3::Did(did.to_vec().try_into().unwrap()),did);
+    }
+    fn public() -> Vec<u8> {
+        sp_core::ByteArray::to_raw_vec(&Self::public(125))
+    }
+    fn sign(payload: &[u8]) -> Vec<u8> {
+        <Self as pallet_resource_rewards::BenchmarkHelper<AccountId>>::sign(125, payload)
+    }
+}
+
+#[cfg(feature = "runtime-benchmarks")]
+impl pallet_application_registry::BenchmarkHelper for ResourceRewardsBenchmarkHelper {
+    fn install_policy(application: &[u8], did: &[u8]) {
+        seed_benchmark_policy(pallet_delivery_policy::PolicyScopeV3::Application(application.to_vec().try_into().unwrap()),did);
+    }
+    fn install_did(did: &[u8], seed: u32) {
+        use frame_support::BoundedVec;
+        use alloc::{format, vec};
+        let account = AccountId::new([0; 32]);
+        <Self as pallet_resource_rewards::BenchmarkHelper<AccountId>>::install_did(&account, did, seed);
+        let public = Self::public(seed);
+        let mut digits = Vec::<u8>::new();
+        const BASE58: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+        for byte in public.0 {
+            let mut carry = byte as u32;
+            for digit in &mut digits { carry += *digit as u32 * 256; *digit = (carry % 58) as u8; carry /= 58; }
+            while carry != 0 { digits.push((carry % 58) as u8); carry /= 58; }
+        }
+        let mut material = vec![b'z'];
+        material.extend(core::iter::repeat_n(b'1', public.0.iter().take_while(|b| **b == 0).count()));
+        material.extend(digits.iter().rev().map(|n| BASE58[*n as usize]));
+        let multibase = core::str::from_utf8(&material).unwrap();
+        let did: pallet_did_registry::DidOf<Runtime> = did.to_vec().try_into().unwrap();
+        pallet_did_registry::Dids::<Runtime>::mutate(&did, |record| {
+            let record = record.as_mut().unwrap();
+            let mut agreements = BoundedVec::default();
+            for n in 0..64 {
+                agreements.try_push(pallet_did_registry::KeyAgreement::<Runtime> {
+                    id: format!("#key-{n}").into_bytes().try_into().unwrap(),
+                    type_: b"opaque".to_vec().try_into().unwrap(), controller: did.to_vec().try_into().unwrap(),
+                    public_key_multibase: vec![b'z'; 3800].try_into().unwrap(),
+                }).unwrap();
+            }
+            let mut methods = BoundedVec::default();
+            for n in 0..5 {
+                let id = format!("#v{n}");
+                let overlay = serde_json::json!({"id": id, "type": "Ed25519VerificationKey2020",
+                    "controller": core::str::from_utf8(&did).unwrap(), "publicKeyMultibase": multibase,
+                    "padding": "a".repeat(3200)});
+                let mut encoded = b"\0OP:KEY:1:".to_vec(); encoded.extend(serde_json::to_vec(&overlay).unwrap());
+                methods.try_push(pallet_did_registry::VerificationMethod::<Runtime> {
+                    id: id.into_bytes().try_into().unwrap(), type_: b"Ed25519VerificationKey2020".to_vec().try_into().unwrap(),
+                    controller: did.to_vec().try_into().unwrap(), public_key_multibase: encoded.try_into().unwrap(),
+                }).unwrap();
+            }
+            record.document = Some(pallet_did_registry::DidDocument::<Runtime> {
+                id: did.clone(), verification_method: methods, authentication: Some((1..5).map(|n| format!("#v{n}").into_bytes().try_into().unwrap()).collect::<Vec<_>>().try_into().unwrap()),
+                key_agreement: agreements, service: None,
+            });
+        });
+    }
+    fn sign(seed: u32, payload: &[u8]) -> Vec<u8> {
+        <Self as pallet_resource_rewards::BenchmarkHelper<AccountId>>::sign(seed, payload)
+    }
+}
+
+#[cfg(feature = "runtime-benchmarks")]
+fn seed_benchmark_policy(scope:pallet_delivery_policy::PolicyScopeV3<Runtime>,did:&[u8]) {
+    let document:pallet_delivery_policy::PolicyDocumentOf<Runtime>=alloc::vec![0xff;65536].try_into().unwrap();
+    pallet_delivery_policy::PoliciesV4::<Runtime>::insert(scope,pallet_delivery_policy::PolicyDocumentRecord::<Runtime> {
+        revision:1,operator_did:did.to_vec().try_into().unwrap(),content_hash:sp_io::hashing::blake2_256(&document),document,
+    });
+}
+
+#[cfg(feature = "runtime-benchmarks")]
+impl pallet_delivery_policy::BenchmarkHelper for ResourceRewardsBenchmarkHelper {
+    fn install(did: &[u8], application: &[u8]) {
+        <Self as pallet_application_registry::BenchmarkHelper>::install_did(did, 1);
+        let id: pallet_application_registry::ApplicationIdOf<Runtime> = application.to_vec().try_into().unwrap();
+        pallet_application_registry::Applications::<Runtime>::insert(id, pallet_application_registry::ApplicationRecord::<Runtime> {
+            control_did: did.to_vec().try_into().unwrap(), status: pallet_application_registry::ApplicationStatus::Active,
+            revision: 1, registered_at: 0, updated_at: 0,
+        });
+    }
+    fn sign(payload: &[u8]) -> Vec<u8> { <Self as pallet_application_registry::BenchmarkHelper>::sign(1, payload) }
+    fn signer() -> Vec<u8> { b"#v4".to_vec() }
+}
+
 impl pallet_resource_rewards::Config for Runtime {
     type GovernanceOrigin = frame_system::EnsureRoot<AccountId>;
     type DidProvider = DidRegistry;
@@ -571,9 +664,34 @@ mod tests {
     use pallet_delivery_policy::weights::WeightInfo as _;
 
     #[test]
+    fn stored_application_with_legacy_controller_has_no_policy_authority() {
+        use pallet_delivery_policy::ApplicationProvider;
+        let storage = frame_system::GenesisConfig::<Runtime>::default().build_storage().unwrap();
+        sp_io::TestExternalities::new(storage).execute_with(|| {
+            let application_id: pallet_application_registry::ApplicationIdOf<Runtime> =
+                b"legacy-test".to_vec().try_into().unwrap();
+            pallet_application_registry::Applications::<Runtime>::insert(
+                application_id,
+                pallet_application_registry::ApplicationRecord::<Runtime> {
+                    control_did: b"did:talaria:1111111111111111111111".to_vec().try_into().unwrap(),
+                    status: pallet_application_registry::ApplicationStatus::Active,
+                    revision: 1,
+                    registered_at: 0,
+                    updated_at: 0,
+                },
+            );
+            assert_eq!(RuntimeApplicationProvider::active_control_did(b"legacy-test"), None);
+            assert_eq!(RuntimeApplicationProvider::verified_domain(b"legacy-test"), None);
+            assert!(!RuntimeApplicationProvider::authorized_send_target(
+                b"legacy-test", b"did:talaria:1111111111111111111111"
+            ));
+        });
+    }
+
+    #[test]
     fn authority_governance_preserves_runtime_compatibility_boundaries() {
-        assert_eq!(VERSION.spec_version, 123);
-        assert_eq!(VERSION.transaction_version, 4);
+        assert_eq!(VERSION.spec_version, 130);
+        assert_eq!(VERSION.transaction_version, 6);
         assert_eq!(
             <<Runtime as pallet_resource_rewards::Config>::BaseEpochReward as Get<Balance>>::get(),
             UNIT
@@ -667,7 +785,7 @@ mod tests {
     }
 
     #[test]
-    fn delivery_policy_v2_reserves_the_normal_extrinsic_budget_until_benchmarked() {
+    fn delivery_policy_v2_reserves_the_mutation_budget_until_benchmarked() {
         type PolicyWeights = <Runtime as pallet_delivery_policy::Config>::WeightInfo;
 
         let block_weights = RuntimeBlockWeights::get();
@@ -675,6 +793,10 @@ mod tests {
             .get(DispatchClass::Normal)
             .max_extrinsic
             .expect("the production runtime bounds Normal extrinsics");
+        let encoded_limit = u64::from(*<Runtime as frame_system::Config>::BlockLength::get()
+            .max.get(DispatchClass::Normal));
+        let mutation_budget = normal_max.saturating_sub(frame_support::weights::Weight::from_parts(
+            100_000_000_000, encoded_limit + 1_048_576));
 
         for direct_mutation in [
             PolicyWeights::set_did_delivery_constraints(),
@@ -688,21 +810,148 @@ mod tests {
             PolicyWeights::set_persona_delivery_constraints(),
             PolicyWeights::set_persona_attestor(),
         ] {
-            assert_eq!(direct_mutation, normal_max);
+            assert_eq!(direct_mutation, mutation_budget);
         }
 
         let authorized_total = PolicyWeights::apply_policy_v2_with_proof()
             .saturating_add(PolicyWeights::authorize_apply_policy_v2_with_proof());
         assert!(authorized_total.all_lte(normal_max));
-        let rounding_remainder = normal_max.saturating_sub(authorized_total);
+        let rounding_remainder = mutation_budget.saturating_sub(authorized_total);
         assert!(rounding_remainder.ref_time() <= 3);
         assert!(rounding_remainder.proof_size() <= 3);
 
         let persona_authorized_total = PolicyWeights::apply_persona_with_proof()
             .saturating_add(PolicyWeights::authorize_apply_persona_with_proof());
         assert!(persona_authorized_total.all_lte(normal_max));
-        let rounding_remainder = normal_max.saturating_sub(persona_authorized_total);
+        let rounding_remainder = mutation_budget.saturating_sub(persona_authorized_total);
         assert!(rounding_remainder.ref_time() <= 3);
         assert!(rounding_remainder.proof_size() <= 3);
     }
+
+    #[test]
+    fn delivery_policy_general_proof_transactions_fit_frame_weight_and_length_checks() {
+        use codec::Encode;
+        use frame_support::dispatch::GetDispatchInfo;
+        use sp_runtime::{generic::Era, traits::TransactionExtension};
+
+        let mut ext = sp_io::TestExternalities::new_empty();
+        ext.execute_with(|| {
+            let extensions: TxExtension = (
+                frame_system::AuthorizeCall::new(),
+                frame_system::CheckNonZeroSender::new(),
+                frame_system::CheckSpecVersion::new(),
+                frame_system::CheckTxVersion::new(),
+                frame_system::CheckGenesis::new(),
+                frame_system::CheckEra::from(Era::Immortal),
+                frame_system::CheckNonce::from(0),
+                frame_system::CheckWeight::new(),
+                pallet_transaction_payment::ChargeTransactionPayment::from(0),
+                frame_metadata_hash_extension::CheckMetadataHash::new(false),
+                frame_system::WeightReclaim::new(),
+            );
+            let calls = [
+                RuntimeCall::DeliveryPolicy(pallet_delivery_policy::Call::apply_persona_with_proof {
+                    signed_payload: vec![0; 65_536], signature: vec![0; 64], signer_key_id: vec![0; 256],
+                }),
+                RuntimeCall::DeliveryPolicy(pallet_delivery_policy::Call::apply_policy_v2_with_proof {
+                    signed_payload: vec![0; 65_536], signature: vec![0; 64], signer_key_id: vec![0; 256],
+                }),
+            ];
+            for call in calls {
+                let mut info = call.get_dispatch_info();
+                info.extension_weight = extensions.weight(&call);
+                let xt = UncheckedExtrinsic::new_transaction(call, extensions.clone());
+                let len = xt.encode().len();
+                assert!(frame_system::CheckWeight::<Runtime>::do_validate(&info, len).is_ok(),
+                    "General proof must include all framework extensions and its encoded length");
+                let max_len = *<Runtime as frame_system::Config>::BlockLength::get()
+                    .max.get(DispatchClass::Normal) as usize;
+                assert!(frame_system::CheckWeight::<Runtime>::do_validate(&info, max_len).is_ok());
+            }
+        });
+    }
+    #[test]
+    fn application_owner_proof_runs_through_general_transaction_pipeline_without_funds() {
+        use codec::Encode;
+        use sp_core::Pair;
+        use sp_runtime::{generic::Era, transaction_validity::TransactionSource};
+        let storage = frame_system::GenesisConfig::<Runtime>::default().build_storage().unwrap();
+        let mut ext = sp_io::TestExternalities::new(storage);
+        ext.execute_with(|| {
+            // Pool validation initializes the next block; preserve the genesis hash.
+            System::set_block_number(1);
+            let root = sp_core::ed25519::Pair::from_seed(&[7; 32]);
+            let raw = b"did:openpayload:1111111111111111";
+            let did: pallet_did_registry::DidOf<Runtime> = raw.to_vec().try_into().unwrap();
+            pallet_did_registry::Dids::<Runtime>::insert(&did, pallet_did_registry::DidRecord::<Runtime> {
+                owner: None, aliases: None, devices: None, document: None, version: 1, updated_at: 0,
+                root_pubkey: Some(root.public().0.to_vec().try_into().unwrap()), delivery_policy_links: None, deactivated: false,
+            });
+            let application_id: pallet_application_registry::ApplicationIdOf<Runtime> = b"unfunded-proof".to_vec().try_into().unwrap();
+            let proof = pallet_application_registry::ApplicationAuthorizationPayload::<Runtime> {
+                genesis_hash: System::block_hash(0), operator_did: raw.to_vec().try_into().unwrap(),
+                signer_key_id: b"root".to_vec().try_into().unwrap(), linked_signer_key_id: None,
+                operation: pallet_application_registry::ApplicationOperation::Register { application_id: application_id.clone() },
+                nonce: 0, valid_until: 60_000,
+            };
+            let payload = ApplicationRegistry::proof_payload(&proof);
+            let call = RuntimeCall::ApplicationRegistry(pallet_application_registry::Call::apply_application_with_proof {
+                signature: root.sign(&payload).0.to_vec().try_into().unwrap(), signed_payload: payload, linked_signature: Default::default(),
+            });
+            let extensions: TxExtension = (
+                frame_system::AuthorizeCall::new(), frame_system::CheckNonZeroSender::new(),
+                frame_system::CheckSpecVersion::new(), frame_system::CheckTxVersion::new(),
+                frame_system::CheckGenesis::new(), frame_system::CheckEra::from(Era::Immortal),
+                frame_system::CheckNonce::from(0), frame_system::CheckWeight::new(),
+                pallet_transaction_payment::ChargeTransactionPayment::from(0),
+                frame_metadata_hash_extension::CheckMetadataHash::new(false), frame_system::WeightReclaim::new(),
+            );
+            let transaction = UncheckedExtrinsic::new_transaction(call, extensions);
+            assert_eq!(Balances::total_issuance(), 0);
+            let validity = Executive::validate_transaction(TransactionSource::External, transaction.clone(), Hash::default());
+            assert!(validity.is_ok(), "General proof rejected: {validity:?}");
+            assert!(Executive::apply_extrinsic(transaction.clone()).unwrap().is_ok());
+            assert!(pallet_application_registry::Applications::<Runtime>::contains_key(&application_id));
+            assert_eq!(pallet_application_registry::AuthorizationNonces::<Runtime>::get(proof.operator_did), 1);
+            assert_eq!(Balances::total_issuance(), 0);
+            assert!(Executive::validate_transaction(TransactionSource::External, transaction, Hash::default()).is_err());
+
+            // A raw application document uses its own proof/nonce with no payer, and is
+            // intentionally invalid JSON: interpretation belongs to services and nodes.
+            let scope = pallet_delivery_policy::PolicyScopeV3::Application(application_id.to_vec().try_into().unwrap());
+            let document = vec![0xff;65_536];
+            let policy = pallet_delivery_policy::PolicyDocumentAuthorizationPayload::<Runtime> {
+                domain:pallet_delivery_policy::POLICY_DOCUMENT_PROOF_DOMAIN.to_vec().try_into().unwrap(),
+                genesis_hash:System::block_hash(0),operator_did:raw.to_vec().try_into().unwrap(),
+                signer_key_id:b"root".to_vec().try_into().unwrap(),
+                operation:pallet_delivery_policy::PolicyDocumentOperation::Set { scope:scope.clone(),revision:1,document:document.clone().try_into().unwrap() },
+                nonce:0,valid_until:60_000,
+            };
+            let bytes=policy.encode();
+            let call=RuntimeCall::DeliveryPolicy(pallet_delivery_policy::Call::apply_policy_document_with_proof {
+                signature:root.sign(&bytes).0.to_vec(),signed_payload:bytes,signer_key_id:b"root".to_vec(),
+            });
+            let extensions: TxExtension = (
+                frame_system::AuthorizeCall::new(), frame_system::CheckNonZeroSender::new(),
+                frame_system::CheckSpecVersion::new(), frame_system::CheckTxVersion::new(),
+                frame_system::CheckGenesis::new(), frame_system::CheckEra::from(Era::Immortal),
+                frame_system::CheckNonce::from(0), frame_system::CheckWeight::new(),
+                pallet_transaction_payment::ChargeTransactionPayment::from(0),
+                frame_metadata_hash_extension::CheckMetadataHash::new(false), frame_system::WeightReclaim::new(),
+            );
+            let transaction=UncheckedExtrinsic::new_transaction(call,extensions);
+            assert!(Executive::validate_transaction(TransactionSource::External,transaction.clone(),Hash::default()).is_ok());
+            assert!(Executive::apply_extrinsic(transaction.clone()).unwrap().is_ok());
+            let record=pallet_delivery_policy::PoliciesV4::<Runtime>::get(&scope).unwrap();
+            assert_eq!(record.document.to_vec(),document);
+            assert_eq!(record.content_hash,sp_io::hashing::blake2_256(&document));
+            assert_eq!(Balances::total_issuance(),0);
+            assert!(Executive::validate_transaction(TransactionSource::External,transaction,Hash::default()).is_err());
+            <RuntimeApplicationPolicyCleanup as pallet_application_registry::ApplicationPolicyCleanup>::clear(&application_id);
+            let record=pallet_delivery_policy::PoliciesV4::<Runtime>::get(scope).unwrap();
+            assert_eq!(record.revision,2);assert!(record.document.is_empty());
+            assert_eq!(pallet_delivery_policy::PolicyV4Nonces::<Runtime>::get(policy.operator_did),1);
+        });
+    }
+
 }

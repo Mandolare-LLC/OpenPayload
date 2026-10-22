@@ -104,6 +104,8 @@ std = [
 ]
 
 runtime-benchmarks = [
+    "pallet-delivery-policy/runtime-benchmarks",
+    "pallet-application-registry/runtime-benchmarks",
 	"sp-io",
 	"frame-benchmarking/runtime-benchmarks",
 	"frame-support/runtime-benchmarks",
@@ -111,6 +113,7 @@ runtime-benchmarks = [
 	"frame-system/runtime-benchmarks",
 	"pallet-balances/runtime-benchmarks",
 	"pallet-grandpa/runtime-benchmarks",
+	"pallet-did-registry/runtime-benchmarks",
 	"pallet-resource-rewards/runtime-benchmarks",
 	"pallet-sudo/runtime-benchmarks",
 	"pallet-timestamp/runtime-benchmarks",

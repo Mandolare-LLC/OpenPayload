@@ -5,8 +5,10 @@ homepage = "https://openpayload.io"
 edition = "2021"
 
 [workspace]
+exclude = ["vendor/hickory-proto-0.24.4", "vendor/hickory-proto-0.25.2"]
 members = [
     "node",
+    "vendor/dnssec-prover",
     "pallets/application-registry",
     "pallets/authority-governance",
     "pallets/did-registry",
@@ -90,3 +92,9 @@ panic = "unwind"
 codegen-units = 1
 inherits = "release"
 lto = true
+
+[patch.crates-io]
+# sc-tracing 47 pins a vulnerable tracing-subscriber; keep the SDK API intact.
+sc-tracing = { path = "vendor/sc-tracing" }
+hickory-proto-024 = { package = "hickory-proto", path = "vendor/hickory-proto-0.24.4" }
+hickory-proto-025 = { package = "hickory-proto", path = "vendor/hickory-proto-0.25.2" }
