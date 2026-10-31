@@ -1,0 +1,189 @@
+{
+  "date": "2026-10-29",
+  "scope": "Ten reported Dependabot alerts, plus compatible security backports discovered while validating them",
+  "lockfile_sha256": "99754e54a6eca5f666fa52f95c2ec2afb016cc30866084799f8b80b3b6e21dfe",
+  "rustsec_database_commit": "ee1a49a2769a24a596afc1c20cb33748d2769586",
+  "cargo_audit_version": "0.22.2",
+  "before_vulnerability_entries": 19,
+  "after_vulnerability_entries": 11,
+  "scanner_limitation": "RustSec skips path dependencies and does not contain all GHSA-only advisories. Backport source provenance and regression tests are required evidence; an omitted scanner finding does not establish a fix.",
+  "alerts": [
+    {
+      "number": 10,
+      "package": "wasmtime",
+      "resolution": "Upgrade 36.0.18 to 36.0.19 and compatible Cranelift packages; also fixes RUSTSEC-2026-0379."
+    },
+    {
+      "number": 5,
+      "package": "yamux",
+      "resolution": "0.13.10 is patched. Legacy 0.12.1 checks oversized SYN Data before allocating a stream; malformed-frame regressions pass on both versions. No dismissal or upstream version relabeling performed."
+    },
+    {
+      "number": 9,
+      "package": "libp2p-quic",
+      "resolution": "Backport e8f35e12c2418b04df6e9cdf036005e8aee3c7a2 to 0.11.1+openpayload.1; four error regressions and local QUIC smoke pass."
+    },
+    {
+      "number": 8,
+      "package": "rustls-webpki",
+      "resolution": "Remove legacy 0.101.7 via TLS compatibility patch; pin resolved 0.103.16."
+    },
+    {
+      "number": 1,
+      "package": "hickory-resolver",
+      "resolution": "Backport bogus-answer rejection to 0.25.2+openpayload.1. Negative-proof errors already propagate in this version. Legacy 0.24.4 uses error-based validation and filters unverified records; current node DNS resolver features do not enable DNSSEC."
+    },
+    {
+      "number": 2,
+      "package": "hickory-resolver",
+      "resolution": "No recursive resolver exists in locked 0.24.4/0.25.2 source; stub chains already use only matching answer-section CNAMEs. Regression verifies irrelevant CNAMEs in answer/authority/additional sections cause no followup query on patched 0.25.2."
+    },
+    {
+      "number": 3,
+      "package": "ring",
+      "resolution": "Remove 0.16.20 by upgrading TLS certificate generator rcgen to 0.12.1; retain 0.17.14."
+    },
+    {
+      "number": 4,
+      "package": "lru",
+      "resolution": "Backport PR224 iterator fix to 0.12.5+openpayload.1; additionally backport PR238 pop panic-safety fix to both 0.7.8+openpayload.1 and 0.12.5+openpayload.1."
+    },
+    {
+      "number": 7,
+      "package": "rustls-webpki",
+      "resolution": "Remove 0.101.7; use 0.103.16."
+    },
+    {
+      "number": 6,
+      "package": "rustls-webpki",
+      "resolution": "Remove 0.101.7; use 0.103.16."
+    }
+  ],
+  "remaining_vulnerability_entries": [
+    {
+      "id": "RUSTSEC-2026-0387",
+      "package": "crypto-bigint",
+      "version": "0.5.5",
+      "title": "Multiple timing variability issues in operations intended to be constant-time",
+      "patched": [
+        ">=0.7.6"
+      ],
+      "in_default_dependency_tree": true
+    },
+    {
+      "id": "RUSTSEC-2026-0258",
+      "package": "h2",
+      "version": "0.3.27",
+      "title": "h2 unbounded empty DATA frames",
+      "patched": [
+        ">=0.4.16"
+      ],
+      "in_default_dependency_tree": false
+    },
+    {
+      "id": "RUSTSEC-2026-0418",
+      "package": "libz-sys",
+      "version": "1.1.29",
+      "title": "libz-sys build script leaks environment variables in the build directory",
+      "patched": [
+        ">=1.1.31"
+      ],
+      "in_default_dependency_tree": false
+    },
+    {
+      "id": "RUSTSEC-2026-0344",
+      "package": "ruzstd",
+      "version": "0.8.3",
+      "title": "Decompression bomb in `ruzstd`: a tiny input can exhaust memory (OOM)",
+      "patched": [
+        ">=0.9.1"
+      ],
+      "in_default_dependency_tree": false
+    },
+    {
+      "id": "RUSTSEC-2026-0383",
+      "package": "webpki-root-certs",
+      "version": "1.0.8",
+      "title": "Bundled root certificates allow trust in distrusted emSign intermediates",
+      "patched": [
+        ">=1.0.10"
+      ],
+      "in_default_dependency_tree": false
+    },
+    {
+      "id": "RUSTSEC-2026-0381",
+      "package": "webpki-roots",
+      "version": "0.25.4",
+      "title": "Bundled root certificates allow trust in distrusted emSign intermediates",
+      "patched": [
+        ">=1.0.10"
+      ],
+      "in_default_dependency_tree": true
+    },
+    {
+      "id": "RUSTSEC-2026-0391",
+      "package": "zstd",
+      "version": "0.13.3",
+      "title": "Data from an abandoned stream leaks into the next stream on a reused context",
+      "patched": [
+        ">=0.14.3"
+      ],
+      "in_default_dependency_tree": true
+    },
+    {
+      "id": "RUSTSEC-2026-0403",
+      "package": "zstd-safe",
+      "version": "6.0.6",
+      "title": "Uninitialized memory exposed when streaming decompression of a legacy frame fails",
+      "patched": [
+        ">=8.2.0"
+      ],
+      "in_default_dependency_tree": true
+    },
+    {
+      "id": "RUSTSEC-2026-0403",
+      "package": "zstd-safe",
+      "version": "7.2.4",
+      "title": "Uninitialized memory exposed when streaming decompression of a legacy frame fails",
+      "patched": [
+        ">=8.2.0"
+      ],
+      "in_default_dependency_tree": true
+    },
+    {
+      "id": "RUSTSEC-2026-0398",
+      "package": "zstd-safe",
+      "version": "7.2.4",
+      "title": "`Seekable::decompress` sets a `Vec` length beyond its capacity for offsets past the end",
+      "patched": [
+        ">=8.2.0"
+      ],
+      "in_default_dependency_tree": true
+    },
+    {
+      "id": "RUSTSEC-2026-0410",
+      "package": "zstd-sys",
+      "version": "2.0.16+zstd.1.5.7",
+      "title": "WebAssembly allocator shim corrupts memory on allocation failure",
+      "patched": [
+        ">=2.1.2"
+      ],
+      "in_default_dependency_tree": true
+    }
+  ],
+  "remaining_warning_counts": {
+    "unmaintained": 8,
+    "unsound": 21
+  },
+  "scope_boundary": "Native dependency changes only; no runtime, genesis or production deployment changes at the original October 29 checkpoint. No Dependabot alerts dismissed.",
+  "workspace": "public community node",
+  "validation": {
+    "regression_tests_passed": 107,
+    "regression_tests_failed": 0,
+    "source_release_build": "passed",
+    "public_package_compile_check": "passed",
+    "isolated_development_chain_block_production": "passed (block 1)",
+    "actual_public_checkout_matches_checked_staging": true,
+    "production_deployment": "not performed"
+  }
+}

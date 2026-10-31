@@ -1,0 +1,137 @@
+{
+  "date": "2026-10-31",
+  "status": "Targeted native security release deployed and verified on all six production chain nodes",
+  "public_source_parent": "115f33386e89c7b243a80760db455790d8c14a6d",
+  "frozen_public_source_id": "7b61ea99c8eb",
+  "public_lockfile_sha256": "c9b49103dda068ddfd188135125ec678e877f62b987e0cc3c5d1efd9d99d90f4",
+  "wasmtime": "36.0.20",
+  "new_advisory_addressed": "RUSTSEC-2026-0424",
+  "retained_runtime_sha256": "8048955d893a678aadb8d1665b7f848ec2bd49b179fe96a53cdd68778ce3e032",
+  "runtime_spec": 130,
+  "transaction_version": 6,
+  "backport_regressions_passed": 107,
+  "workspace_tests_passed": 192,
+  "workspace_scope": "Excludes upstream dnssec-prover crate; its resolver backport checks are included in the security regressions",
+  "public_compile_check": "passed",
+  "macos_isolated_block_production": "passed",
+  "remaining_vulnerability_entries": [
+    {
+      "id": "RUSTSEC-2026-0387",
+      "package": "crypto-bigint",
+      "version": "0.5.5",
+      "title": "Multiple timing variability issues in operations intended to be constant-time"
+    },
+    {
+      "id": "RUSTSEC-2026-0258",
+      "package": "h2",
+      "version": "0.3.27",
+      "title": "h2 unbounded empty DATA frames"
+    },
+    {
+      "id": "RUSTSEC-2026-0418",
+      "package": "libz-sys",
+      "version": "1.1.29",
+      "title": "libz-sys build script leaks environment variables in the build directory"
+    },
+    {
+      "id": "RUSTSEC-2026-0344",
+      "package": "ruzstd",
+      "version": "0.8.3",
+      "title": "Decompression bomb in `ruzstd`: a tiny input can exhaust memory (OOM)"
+    },
+    {
+      "id": "RUSTSEC-2026-0383",
+      "package": "webpki-root-certs",
+      "version": "1.0.8",
+      "title": "Bundled root certificates allow trust in distrusted emSign intermediates"
+    },
+    {
+      "id": "RUSTSEC-2026-0381",
+      "package": "webpki-roots",
+      "version": "0.25.4",
+      "title": "Bundled root certificates allow trust in distrusted emSign intermediates"
+    },
+    {
+      "id": "RUSTSEC-2026-0391",
+      "package": "zstd",
+      "version": "0.13.3",
+      "title": "Data from an abandoned stream leaks into the next stream on a reused context"
+    },
+    {
+      "id": "RUSTSEC-2026-0403",
+      "package": "zstd-safe",
+      "version": "6.0.6",
+      "title": "Uninitialized memory exposed when streaming decompression of a legacy frame fails"
+    },
+    {
+      "id": "RUSTSEC-2026-0403",
+      "package": "zstd-safe",
+      "version": "7.2.4",
+      "title": "Uninitialized memory exposed when streaming decompression of a legacy frame fails"
+    },
+    {
+      "id": "RUSTSEC-2026-0398",
+      "package": "zstd-safe",
+      "version": "7.2.4",
+      "title": "`Seekable::decompress` sets a `Vec` length beyond its capacity for offsets past the end"
+    },
+    {
+      "id": "RUSTSEC-2026-0410",
+      "package": "zstd-sys",
+      "version": "2.0.16+zstd.1.5.7",
+      "title": "WebAssembly allocator shim corrupts memory on allocation failure"
+    }
+  ],
+  "remaining_warning_counts": {
+    "unmaintained": 8,
+    "unsound": 21
+  },
+  "audit_clean": false,
+  "runtime_or_genesis_changed": false,
+  "linux_builds": {
+    "openpayload-node-linux-aarch64": {
+      "bytes": 83476032,
+      "sha256": "941979465ead0c48ebd7f27a56592e6bb731125ea23de695f410038e0772e4fa",
+      "embedded_runtime_exact": true
+    },
+    "openpayload-node-linux-x86_64": {
+      "bytes": 90060000,
+      "sha256": "f3b2ef48206ce4173b3b91d7a3b95111c5bad2a93898b49f85c8156bf915a9c0",
+      "embedded_runtime_exact": true
+    }
+  },
+  "rustsec_database_commit": "2295466c4e9df26647fd67d8fa1c705ac2fc7f81",
+  "linux_builds_verified_after_transfer": true,
+  "linux_smoke_tests": {
+    "x86_64": {
+      "passed": true,
+      "native_version": "openpayload-node-linux-x86_64 0.1.0-security-7b61ea99c8eb",
+      "database": "paritydb",
+      "block": 1,
+      "embedded_runtime_exact": true,
+      "public_genesis_guard": true,
+      "emulated": false
+    },
+    "aarch64": {
+      "passed": true,
+      "native_version": "openpayload-node-linux-aarch64 0.1.0-security-7b61ea99c8eb",
+      "database": "paritydb",
+      "block": 1,
+      "embedded_runtime_exact": true,
+      "public_genesis_guard": true,
+      "emulated": true
+    }
+  },
+  "verified_at_utc": "2026-10-31T22:09:01.123838+00:00",
+  "production_deployment": true,
+  "remaining_advisory_entries_count": 11,
+  "deployment_summary": {
+    "chain_nodes_verified": 6,
+    "architecture_counts": {
+      "aarch64": 4,
+      "x86_64": 2
+    },
+    "all_healthy": true,
+    "automatic_restarts": 0
+  }
+}

@@ -5,7 +5,11 @@ homepage = "https://openpayload.io"
 edition = "2021"
 
 [workspace]
-exclude = ["vendor/hickory-proto-0.24.4", "vendor/hickory-proto-0.25.2"]
+exclude = [
+    "vendor/hickory-proto-0.24.4", "vendor/hickory-proto-0.25.2",
+    "vendor/hickory-resolver-0.25.2", "vendor/libp2p-quic-0.11.1",
+    "vendor/libp2p-tls-0.5.0", "vendor/lru-0.7.8", "vendor/lru-0.12.5",
+]
 members = [
     "node",
     "vendor/dnssec-prover",
@@ -98,3 +102,9 @@ lto = true
 sc-tracing = { path = "vendor/sc-tracing" }
 hickory-proto-024 = { package = "hickory-proto", path = "vendor/hickory-proto-0.24.4" }
 hickory-proto-025 = { package = "hickory-proto", path = "vendor/hickory-proto-0.25.2" }
+# Security backports retain the APIs required by the pinned Polkadot SDK.
+hickory-resolver = { path = "vendor/hickory-resolver-0.25.2" }
+libp2p-quic = { path = "vendor/libp2p-quic-0.11.1" }
+libp2p-tls = { path = "vendor/libp2p-tls-0.5.0" }
+lru-007 = { package = "lru", path = "vendor/lru-0.7.8" }
+lru-012 = { package = "lru", path = "vendor/lru-0.12.5" }
