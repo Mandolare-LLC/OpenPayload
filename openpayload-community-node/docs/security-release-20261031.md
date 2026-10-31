@@ -1,5 +1,7 @@
 # Native node security release — October 31, 2026
 
+A subsequent [native follow-up](security-residual-20261031.md) addresses ten of the eleven residual vulnerability entries recorded below. This report preserves the initial deployment checkpoint.
+
 The targeted native security release is deployed and independently verified on four production consensus authorities and two observer/RPC nodes. The existing runtime remains spec 130 / transaction version 6. Genesis, chain specifications, service definitions, node identities and persistent chain state were retained.
 
 ## Changes and validation

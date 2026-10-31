@@ -6,6 +6,13 @@ edition = "2021"
 
 [workspace]
 exclude = [
+    "vendor/libp2p-websocket-0.44.0",
+    "vendor/zstd-0.13.3",
+    "vendor/zstd-safe-6.0.6",
+    "vendor/zstd-safe-7.2.4",
+    "vendor/h2-0.3.27",
+    "vendor/ruzstd-0.8.3",
+
     "vendor/hickory-proto-0.24.4", "vendor/hickory-proto-0.25.2",
     "vendor/hickory-resolver-0.25.2", "vendor/libp2p-quic-0.11.1",
     "vendor/libp2p-tls-0.5.0", "vendor/lru-0.7.8", "vendor/lru-0.12.5",
@@ -108,3 +115,11 @@ libp2p-quic = { path = "vendor/libp2p-quic-0.11.1" }
 libp2p-tls = { path = "vendor/libp2p-tls-0.5.0" }
 lru-007 = { package = "lru", path = "vendor/lru-0.7.8" }
 lru-012 = { package = "lru", path = "vendor/lru-0.12.5" }
+
+# Residual advisory remediation; upstream APIs remain pinned for SDK compatibility.
+libp2p-websocket = { path = "vendor/libp2p-websocket-0.44.0" }
+zstd = { path = "vendor/zstd-0.13.3" }
+zstd-safe-006 = { package = "zstd-safe", path = "vendor/zstd-safe-6.0.6" }
+zstd-safe-007 = { package = "zstd-safe", path = "vendor/zstd-safe-7.2.4" }
+h2 = { path = "vendor/h2-0.3.27" }
+ruzstd = { path = "vendor/ruzstd-0.8.3" }

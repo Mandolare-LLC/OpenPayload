@@ -1,0 +1,170 @@
+{
+  "date": "2026-10-31",
+  "phase": "native follow-up",
+  "status": "deployed_verified_crypto_open",
+  "frozen_public_source_id": "11c8a2df20f4",
+  "runtime_spec": 130,
+  "transaction_version": 6,
+  "runtime_or_genesis_changed": false,
+  "retained_runtime_sha256": "8048955d893a678aadb8d1665b7f848ec2bd49b179fe96a53cdd68778ce3e032",
+  "test_results": {
+    "residual_backports_passed": 547,
+    "previous_backports_passed": 107,
+    "workspace_release_tests_passed": 192,
+    "upstream_h2_ignored_tests": 1
+  },
+  "linux_builds": {
+    "openpayload-node-linux-aarch64": {
+      "bytes": 83541360,
+      "sha256": "66ddd7e7edfb31d1602fc314dc5ed887fedd752b6f56ca9891b0895571afb33a",
+      "embedded_runtime_exact": true
+    },
+    "openpayload-node-linux-x86_64": {
+      "bytes": 90038000,
+      "sha256": "6744155a442ac68570f7a3f5c302e16b7cebca166fd59a4d90433ea08814833b",
+      "embedded_runtime_exact": true
+    }
+  },
+  "linux_smoke_tests": {
+    "x86_64": {
+      "passed": true,
+      "native_version": "openpayload-node-linux-x86_64 0.1.0-security-11c8a2df20f4",
+      "database": "paritydb",
+      "block": 1,
+      "embedded_runtime_exact": true,
+      "public_genesis_guard": true,
+      "emulated": false
+    },
+    "aarch64": {
+      "passed": true,
+      "native_version": "openpayload-node-linux-aarch64 0.1.0-security-11c8a2df20f4",
+      "database": "paritydb",
+      "block": 1,
+      "embedded_runtime_exact": true,
+      "public_genesis_guard": true,
+      "emulated": true
+    }
+  },
+  "macos_isolated_block_production": true,
+  "audit_clean": false,
+  "remaining_vulnerability_entries": [
+    {
+      "id": "RUSTSEC-2026-0387",
+      "package": "crypto-bigint",
+      "version": "0.5.5",
+      "status": "open_requires_compatible_crypto_and_runtime_qualification"
+    }
+  ],
+  "scanner_warning_counts": {
+    "unmaintained": 8,
+    "unsound": 3
+  },
+  "scanner_limitations": "Local-path forks are omitted by Cargo audit. Source provenance and executable regressions support backport dispositions. Prior vendored warnings remain review obligations; reduced warning counts are not closure.",
+  "rustsec_database_commit": "2295466c4e9df26647fd67d8fa1c705ac2fc7f81",
+  "postgresql_started": false,
+  "temporary_release_builder": "stopped",
+  "addressed_prior_vulnerability_entries": [
+    {
+      "id": "RUSTSEC-2026-0258",
+      "package": "h2",
+      "version": "0.3.27",
+      "title": "h2 unbounded empty DATA frames"
+    },
+    {
+      "id": "RUSTSEC-2026-0418",
+      "package": "libz-sys",
+      "version": "1.1.29",
+      "title": "libz-sys build script leaks environment variables in the build directory"
+    },
+    {
+      "id": "RUSTSEC-2026-0344",
+      "package": "ruzstd",
+      "version": "0.8.3",
+      "title": "Decompression bomb in `ruzstd`: a tiny input can exhaust memory (OOM)"
+    },
+    {
+      "id": "RUSTSEC-2026-0383",
+      "package": "webpki-root-certs",
+      "version": "1.0.8",
+      "title": "Bundled root certificates allow trust in distrusted emSign intermediates"
+    },
+    {
+      "id": "RUSTSEC-2026-0381",
+      "package": "webpki-roots",
+      "version": "0.25.4",
+      "title": "Bundled root certificates allow trust in distrusted emSign intermediates"
+    },
+    {
+      "id": "RUSTSEC-2026-0391",
+      "package": "zstd",
+      "version": "0.13.3",
+      "title": "Data from an abandoned stream leaks into the next stream on a reused context"
+    },
+    {
+      "id": "RUSTSEC-2026-0403",
+      "package": "zstd-safe",
+      "version": "6.0.6",
+      "title": "Uninitialized memory exposed when streaming decompression of a legacy frame fails"
+    },
+    {
+      "id": "RUSTSEC-2026-0403",
+      "package": "zstd-safe",
+      "version": "7.2.4",
+      "title": "Uninitialized memory exposed when streaming decompression of a legacy frame fails"
+    },
+    {
+      "id": "RUSTSEC-2026-0398",
+      "package": "zstd-safe",
+      "version": "7.2.4",
+      "title": "`Seekable::decompress` sets a `Vec` length beyond its capacity for offsets past the end"
+    },
+    {
+      "id": "RUSTSEC-2026-0410",
+      "package": "zstd-sys",
+      "version": "2.0.16+zstd.1.5.7",
+      "title": "WebAssembly allocator shim corrupts memory on allocation failure"
+    }
+  ],
+  "verified_at_utc": "2026-10-31T22:43:37.673444+00:00",
+  "deployment_summary": {
+    "authorities": 4,
+    "observers": 2,
+    "all_active": true,
+    "all_not_syncing": true,
+    "peers_each": 5,
+    "automatic_restarts": 0,
+    "finalized_block_min": 718403,
+    "finalized_block_max": 718404,
+    "previous_executables_retained": true,
+    "chain_spec_unit_runtime_genesis_unchanged": true,
+    "independent_finality_verified": true,
+    "all_authorities_healthy_before_each_authority_restart": true,
+    "opendispatch_health_passed": true
+  },
+  "negative_controls": {
+    "zstd-0.13.3": {
+      "expected_assertion_failures": true,
+      "failed_tests": [
+        "2"
+      ]
+    },
+    "h2-0.3.27": {
+      "expected_assertion_failures": true,
+      "failed_tests": [
+        "2"
+      ]
+    },
+    "zstd-safe-7.2.4": {
+      "expected_assertion_failures": true,
+      "failed_tests": [
+        "1"
+      ]
+    },
+    "zstd-safe-6.0.6": {
+      "expected_assertion_failures": true,
+      "failed_tests": [
+        "1"
+      ]
+    }
+  }
+}

@@ -1,0 +1,142 @@
+{
+  "libp2p-websocket-0.44.0": {
+    "registry_archive_sha256": "888b2ff2e5d8dcef97283daab35ad1043d18952b65e05279eecbe02af4c6e347",
+    "changes": [
+      {
+        "path": "Cargo.toml",
+        "sha256": "5b2af442dc179318613f10dd015933693ed788d38c9412599198964b88b12c58",
+        "new": false
+      },
+      {
+        "path": "Cargo.toml.orig",
+        "sha256": "050a50aeae93d125586c7ec73a1812a7a3ab432d6b36764719cc33bbd6d27c70",
+        "new": false
+      },
+      {
+        "path": "src/tls.rs",
+        "sha256": "e792010d7efbc136631717b00e1d8346b06f6bfa980744ccee7c63ca73e5b67f",
+        "new": false
+      }
+    ]
+  },
+  "zstd-0.13.3": {
+    "registry_archive_sha256": "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a",
+    "changes": [
+      {
+        "path": "Cargo.toml",
+        "sha256": "0d85c2c2c0ffb98007ce23e603484b74eddca6269df6be8b008ea939118b6913",
+        "new": false
+      },
+      {
+        "path": "src/stream/raw.rs",
+        "sha256": "220d0d7ffd12c2bcd54d196416997dff44475b20e1a1a4d9ac159981f38d546a",
+        "new": false
+      },
+      {
+        "path": "src/stream/tests.rs",
+        "sha256": "9b903361c3d9b7015cc2b2f27068a83ce4c66d0a0bdbb0afc77a378a08ddc8bb",
+        "new": false
+      }
+    ]
+  },
+  "zstd-safe-6.0.6": {
+    "registry_archive_sha256": "ee98ffd0b48ee95e6c5168188e44a54550b1564d9d530ee21d5f0eaed1069581",
+    "changes": [
+      {
+        "path": "Cargo.toml",
+        "sha256": "3b60e14eed465f5454fd989a879cc16abda86098954b63fd4593141b7d536f49",
+        "new": false
+      },
+      {
+        "path": "src/lib.rs",
+        "sha256": "744e3ff83a15b681505a725872f9323f3f18c8725ed1702c9f3535f9af09232b",
+        "new": false
+      },
+      {
+        "path": "src/tests.rs",
+        "sha256": "580a05d1316db8329785e17cade2c2d5b3be24b6e39797b4c549b75a8eb6c5bf",
+        "new": false
+      }
+    ]
+  },
+  "zstd-safe-7.2.4": {
+    "registry_archive_sha256": "8f49c4d5f0abb602a93fb8736af2a4f4dd9512e36f7f570d66e65ff867ed3b9d",
+    "changes": [
+      {
+        "path": "Cargo.toml",
+        "sha256": "78ce77fae6555fe8c97e7f81dcb46cc12d5de0329a71c18291fb4ee46a514af3",
+        "new": false
+      },
+      {
+        "path": "src/lib.rs",
+        "sha256": "e82dd41f1ba5c2ba52c2e2080257fc3eb71933055184a05bde838aeae0dcba20",
+        "new": false
+      },
+      {
+        "path": "src/seekable.rs",
+        "sha256": "30f95188328b68c91518a8cc6df92aae6efbd40697f31a23677c1cfc1d9618ea",
+        "new": false
+      },
+      {
+        "path": "src/tests.rs",
+        "sha256": "e74e3944e8e3955e0e932d8aee8a59c1d1b2a0b65f0a6f7422f55aeaa70a7cde",
+        "new": false
+      }
+    ]
+  },
+  "h2-0.3.27": {
+    "registry_archive_sha256": "0beca50380b1fc32983fc1cb4587bfa4bb9e78fc259aad4a0032d2080309222d",
+    "changes": [
+      {
+        "path": "Cargo.toml",
+        "sha256": "ac31ca3bd95efa70f0c39c1d55f9285c3ef856b48b3ec2fe6acb6c590b9d9d48",
+        "new": false
+      },
+      {
+        "path": "src/proto/mod.rs",
+        "sha256": "240759bb2d2d0dca6f4e0f4abecf8abc8391b834c87fc966923895239b80128a",
+        "new": false
+      },
+      {
+        "path": "src/proto/streams/counts.rs",
+        "sha256": "bad2e7d576c9195362babd0e4c0e3f7a3b842dfe06abf54a2db5d45e454f2a27",
+        "new": false
+      },
+      {
+        "path": "src/proto/streams/recv.rs",
+        "sha256": "421c4995aecb724335700155c5727fd09f895413e1a2b33c28c2ae11f0d71d28",
+        "new": false
+      },
+      {
+        "path": "src/proto/streams/streams.rs",
+        "sha256": "7ed748b74008070c4f34af8dd5a9c7fb9c679a75cbc26de8e4ef2648abb2be6c",
+        "new": false
+      },
+      {
+        "path": "tests/openpayload_data_budget.rs",
+        "sha256": "cd096ff7baa10f3bf10161e3f154d5d830963b672b103ba9e90444d8bfb1284c",
+        "new": true
+      }
+    ]
+  },
+  "ruzstd-0.8.3": {
+    "registry_archive_sha256": "a7c1c839d570d835527c9a5e4db7cb2198683a988cb9d7293fc8674e6bd58fc8",
+    "changes": [
+      {
+        "path": "src/decoding/block_decoder.rs",
+        "sha256": "19670af603bcf48e67dbff1ed1c653ab1230f57826870d19a9085d7671f89cbb",
+        "new": false
+      },
+      {
+        "path": "src/decoding/errors.rs",
+        "sha256": "92f22fd0e4bd26961f79a19607de8faed67b039e0df109a2c7f1d276b5e2fe55",
+        "new": false
+      },
+      {
+        "path": "src/decoding/sequence_execution.rs",
+        "sha256": "0531accaaccc50206f760bf52b9f1d01ff367d9a9b0c1c49eec89762bbb2be55",
+        "new": false
+      }
+    ]
+  }
+}
