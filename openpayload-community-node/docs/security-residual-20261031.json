@@ -61,7 +61,7 @@
   },
   "scanner_limitations": "Local-path forks are omitted by Cargo audit. Source provenance and executable regressions support backport dispositions. Prior vendored warnings remain review obligations; reduced warning counts are not closure.",
   "rustsec_database_commit": "2295466c4e9df26647fd67d8fa1c705ac2fc7f81",
-  "postgresql_started": false,
+  "postgresql_started": true,
   "temporary_release_builder": "stopped",
   "addressed_prior_vulnerability_entries": [
     {
@@ -166,5 +166,7 @@
         "1"
       ]
     }
-  }
+  },
+  "postgresql_status": "production_cutover_completed_separately_in_parallel_remaining_qualification_open",
+  "postgresql_status_reconciled": "2026-10-31"
 }

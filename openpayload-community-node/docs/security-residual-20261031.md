@@ -40,7 +40,7 @@ The 0.7 fixes cannot be applied mechanically to 0.5: UintRef and BoxedMontyForm 
 
 The next crypto change must either use a supported SDK/RustCrypto combination selecting the fixed package, or a reviewed 0.5 compatibility backport covering the applicable primitives. Acceptance requires differential arithmetic/signature tests, no_std/Wasm compilation, constant-time analysis of optimized code for both Linux architectures, runtime/state/weight compatibility qualification and a separately versioned runtime release if the Wasm changes. Unit tests or timing averages alone are insufficient constant-time evidence. Prepare the runtime and upgrade artifacts for the established offline signing/review process; never replace the retained runtime implicitly during a native binary rollout.
 
-The refreshed audit reports one vulnerability entry (crypto-bigint), eight unmaintained warnings and three unsoundness warnings. Scanner counts decrease partly because local path dependencies are omitted; prior warnings on vendored packages remain review obligations. No blanket ignore or alert dismissal has been added. TAL-63 stays In Progress, and PostgreSQL cutover work remains gated.
+The refreshed audit reports one vulnerability entry (crypto-bigint), eight unmaintained warnings and three unsoundness warnings. Scanner counts decrease partly because local path dependencies are omitted; prior warnings on vendored packages remain review obligations. No blanket ignore or alert dismissal has been added. TAL-63 stays In Progress. The separate OpenDispatch PostgreSQL production cutover completed in parallel; its remaining qualification is tracked separately in TAL-69–TAL-76.
 
 ## Verified native deployment
 
@@ -55,4 +55,8 @@ An observer canary passed first, then the other observer and each authority were
 
 The previous executables remain installed. Rollback restores the recorded previous selector and restarts one service at a time, verifying health and independent finality before continuing. No chain keys, persistent state, service definitions or on-chain code were changed. Full operator evidence remains private; the companion JSON contains public aggregate results.
 
-Crypto exposure review found that native std sp-core ECDSA signing selects the separate secp256k1 backend; the inspected frame-support k256 path handles public-key uncompression/address derivation. p256 is a delivery-policy test dependency. These observations narrow the identified exposure but do not establish complete constant-time safety or remediate RUSTSEC-2026-0387. The compatible crypto fix and separate runtime qualification remain the next security gate before PostgreSQL cutover.
+Crypto exposure review found that native std sp-core ECDSA signing selects the separate secp256k1 backend; the inspected frame-support k256 path handles public-key uncompression/address derivation. p256 is a delivery-policy test dependency. These observations narrow the identified exposure but do not establish complete constant-time safety or remediate RUSTSEC-2026-0387. The compatible crypto fix and separate runtime qualification remain the next native security work. Directory, Cache metadata and Talaria control completed their PostgreSQL production cutover in parallel, as subsequently reconciled against the separate release evidence.
+
+## Cross-chat reconciliation
+
+The OpenDispatch production PostgreSQL cutover completed separately on October 31, alongside this native security release. The earlier statement that it had not started was stale. Database cutover completion and remaining native security remediation are tracked independently; broader database recovery and delivery qualification remains open.
